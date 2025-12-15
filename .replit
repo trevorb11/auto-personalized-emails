@@ -1,0 +1,19 @@
+run = "python main.py"
+entrypoint = "main.py"
+
+[nix]
+channel = "stable-24_05"
+
+[unitTest]
+language = "python3"
+
+[deployment]
+run = ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT main:app"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[env]
+FLASK_SECRET_KEY = "change-this-in-production-to-a-secure-random-string"
