@@ -2,7 +2,8 @@
 SQLite database layer for MCA lead tracking.
 
 Handles UCC filings storage, lead scoring history,
-enrichment data, and GHL export tracking.
+enrichment data, GHL export tracking, inbound discovery
+leads, GHL sync snapshots, and opportunity tracking.
 """
 import sqlite3
 from datetime import datetime, timedelta
@@ -54,6 +55,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
         CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filing_id INTEGER REFERENCES filings(id),
+            source TEXT DEFAULT 'ucc',
             business_name TEXT NOT NULL,
             phone TEXT,
             email TEXT,
@@ -76,6 +78,12 @@ def init_db(db_path: Optional[Path] = None) -> None:
             estimated_funding_amount TEXT,
             ucc_filing_age_months REAL,
             has_existing_mca BOOLEAN DEFAULT 0,
+            domain TEXT,
+            description TEXT,
+            linkedin TEXT,
+            contact_position TEXT,
+            email_confidence INTEGER,
+            clearbit_data TEXT,
             ghl_contact_id TEXT,
             exported_to_ghl BOOLEAN DEFAULT 0,
             exported_at TEXT,
@@ -92,6 +100,60 @@ def init_db(db_path: Optional[Path] = None) -> None:
             ON leads(exported_to_ghl);
         CREATE INDEX IF NOT EXISTS idx_leads_batch
             ON leads(batch_date);
+        CREATE INDEX IF NOT EXISTS idx_leads_source
+            ON leads(source);
+        CREATE INDEX IF NOT EXISTS idx_leads_domain
+            ON leads(domain);
+
+        -- GHL sync snapshots: stores periodic CRM state pulls
+        CREATE TABLE IF NOT EXISTS ghl_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            total_contacts INTEGER DEFAULT 0,
+            new_contacts_24h INTEGER DEFAULT 0,
+            open_opportunities INTEGER DEFAULT 0,
+            pipeline_summary TEXT,
+            recent_conversations INTEGER DEFAULT 0,
+            upcoming_appointments INTEGER DEFAULT 0,
+            raw_data TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- GHL opportunities tracked locally for pipeline analytics
+        CREATE TABLE IF NOT EXISTS opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ghl_opportunity_id TEXT UNIQUE,
+            ghl_contact_id TEXT,
+            pipeline_name TEXT,
+            stage_name TEXT,
+            name TEXT,
+            monetary_value REAL DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            source TEXT,
+            last_synced TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_opps_status
+            ON opportunities(status);
+        CREATE INDEX IF NOT EXISTS idx_opps_contact
+            ON opportunities(ghl_contact_id);
+
+        -- Inbound discovery tracking: prevents re-discovering same domains
+        CREATE TABLE IF NOT EXISTS discovered_domains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT UNIQUE NOT NULL,
+            business_name TEXT,
+            industry TEXT,
+            city TEXT,
+            state TEXT,
+            first_seen TEXT DEFAULT (datetime('now')),
+            enriched BOOLEAN DEFAULT 0,
+            lead_id INTEGER REFERENCES leads(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_domains_domain
+            ON discovered_domains(domain);
 
         CREATE TABLE IF NOT EXISTS daily_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +168,9 @@ def init_db(db_path: Optional[Path] = None) -> None:
             tier_d_count INTEGER DEFAULT 0,
             contacts_created_ghl INTEGER DEFAULT 0,
             emails_drafted INTEGER DEFAULT 0,
+            inbound_discovered INTEGER DEFAULT 0,
+            inbound_enriched INTEGER DEFAULT 0,
+            ghl_snapshot_id INTEGER,
             errors TEXT,
             status TEXT DEFAULT 'running'
         );
@@ -294,6 +359,9 @@ def complete_daily_run(conn: sqlite3.Connection, run_id: int, stats: dict) -> No
             tier_d_count = ?,
             contacts_created_ghl = ?,
             emails_drafted = ?,
+            inbound_discovered = ?,
+            inbound_enriched = ?,
+            ghl_snapshot_id = ?,
             errors = ?,
             status = 'completed'
         WHERE id = ?
@@ -307,7 +375,110 @@ def complete_daily_run(conn: sqlite3.Connection, run_id: int, stats: dict) -> No
         stats.get("tier_d", 0),
         stats.get("contacts_created", 0),
         stats.get("emails_drafted", 0),
+        stats.get("inbound_discovered", 0),
+        stats.get("inbound_enriched", 0),
+        stats.get("ghl_snapshot_id"),
         stats.get("errors"),
         run_id,
     ))
     conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════════
+# INBOUND DISCOVERY TRACKING
+# ═══════════════════════════════════════════════════════════════
+
+def is_domain_known(conn: sqlite3.Connection, domain: str) -> bool:
+    """Check if a domain has already been discovered."""
+    row = conn.execute(
+        "SELECT 1 FROM discovered_domains WHERE domain = ?", (domain,)
+    ).fetchone()
+    return row is not None
+
+
+def record_domain(
+    conn: sqlite3.Connection,
+    domain: str,
+    business_name: str = "",
+    industry: str = "",
+    city: str = "",
+    state: str = "",
+    lead_id: Optional[int] = None,
+) -> None:
+    """Record a discovered domain to prevent re-processing."""
+    conn.execute("""
+        INSERT OR IGNORE INTO discovered_domains
+        (domain, business_name, industry, city, state, lead_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (domain, business_name, industry, city, state, lead_id))
+
+
+def get_undiscovered_count(conn: sqlite3.Connection) -> int:
+    """Get count of domains not yet enriched."""
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM discovered_domains WHERE enriched = 0"
+    ).fetchone()
+    return row["cnt"] if row else 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# GHL SNAPSHOTS
+# ═══════════════════════════════════════════════════════════════
+
+def save_ghl_snapshot(conn: sqlite3.Connection, snapshot: dict) -> int:
+    """Save a GHL inbound snapshot to the database."""
+    import json
+    cursor = conn.execute("""
+        INSERT INTO ghl_snapshots
+        (snapshot_date, total_contacts, new_contacts_24h,
+         open_opportunities, pipeline_summary,
+         recent_conversations, upcoming_appointments, raw_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().strftime("%Y-%m-%d"),
+        len(snapshot.get("new_contacts", [])),
+        len(snapshot.get("new_contacts", [])),
+        len(snapshot.get("open_opportunities", [])),
+        json.dumps([
+            {"name": p.get("name"), "stages": len(p.get("stages", []))}
+            for p in snapshot.get("pipelines", [])
+        ]),
+        len(snapshot.get("recent_conversations", [])),
+        len(snapshot.get("upcoming_appointments", [])),
+        json.dumps(snapshot, default=str),
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def sync_opportunities(conn: sqlite3.Connection, opportunities: list[dict]) -> int:
+    """Sync opportunities from GHL snapshot into local tracking table."""
+    synced = 0
+    for opp in opportunities:
+        opp_id = opp.get("id", "")
+        if not opp_id:
+            continue
+        conn.execute("""
+            INSERT INTO opportunities
+            (ghl_opportunity_id, ghl_contact_id, pipeline_name,
+             stage_name, name, monetary_value, status, source, last_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ghl_opportunity_id) DO UPDATE SET
+                stage_name = excluded.stage_name,
+                monetary_value = excluded.monetary_value,
+                status = excluded.status,
+                last_synced = excluded.last_synced
+        """, (
+            opp_id,
+            opp.get("contact", {}).get("id", "") if isinstance(opp.get("contact"), dict) else opp.get("contactId", ""),
+            opp.get("_pipeline_name", ""),
+            opp.get("pipelineStageId", ""),
+            opp.get("name", ""),
+            opp.get("monetaryValue", 0),
+            opp.get("status", "open"),
+            opp.get("source", ""),
+            datetime.now().isoformat(),
+        ))
+        synced += 1
+    conn.commit()
+    return synced

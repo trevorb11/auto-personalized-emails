@@ -19,10 +19,22 @@ for d in [DATA_DIR, LOGS_DIR, UCC_DATA_DIR, ENRICHED_DIR]:
 
 # ── API Keys (loaded from environment) ─────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# GoHighLevel
 GHL_API_KEY = os.environ.get("GHL_API_KEY", "")
 GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "")
 GHL_BASE_URL = os.environ.get("GHL_BASE_URL", "https://services.leadconnectorhq.com")
+
+# Google (Maps/Places + Custom Search Engine)
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+GOOGLE_CSE_API_KEY = os.environ.get("GOOGLE_CSE_API_KEY", "")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
+
+# Inbound lead enrichment (Hunter.io + Clearbit)
+HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
+CLEARBIT_API_KEY = os.environ.get("CLEARBIT_API_KEY", "")
+
+# Notifications
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 # ── Agent settings ─────────────────────────────────────────────
@@ -35,6 +47,9 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 # ── Daily caps (safety limits) ─────────────────────────────────
 DAILY_GHL_CREATES = int(os.environ.get("DAILY_GHL_CREATES", "100"))
 DAILY_GOOGLE_LOOKUPS = int(os.environ.get("DAILY_GOOGLE_LOOKUPS", "200"))
+DAILY_CSE_SEARCHES = int(os.environ.get("DAILY_CSE_SEARCHES", "50"))
+DAILY_HUNTER_LOOKUPS = int(os.environ.get("DAILY_HUNTER_LOOKUPS", "25"))
+DAILY_CLEARBIT_LOOKUPS = int(os.environ.get("DAILY_CLEARBIT_LOOKUPS", "50"))
 DAILY_CLAUDE_TOKENS = int(os.environ.get("DAILY_CLAUDE_TOKENS", "500000"))
 
 # ── Target states for UCC processing ──────────────────────────

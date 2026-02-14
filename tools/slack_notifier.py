@@ -58,6 +58,15 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
         f"*MCA Prospecting Agent - Morning Report*",
         f"_{date_str}_\n",
         f"*Leads Processed:* {stats.get('total_leads', 0)}",
+    ]
+
+    # Source breakdown
+    ucc = stats.get("ucc_leads", 0)
+    inbound = stats.get("inbound_leads", 0)
+    if ucc or inbound:
+        lines.append(f"  UCC Filings: {ucc} | Inbound Discovery: {inbound}")
+
+    lines.extend([
         "",
         "*Tier Breakdown:*",
         f"  A (70+): {stats.get('tier_a', 0)} leads",
@@ -66,7 +75,18 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
         f"  D (<30): {stats.get('tier_d', 0)} leads",
         f"  Avg Score: {stats.get('avg_score', 0):.0f}",
         "",
-    ]
+    ])
+
+    # GHL sync info
+    ghl_opps = stats.get("ghl_open_opps", 0)
+    ghl_contacts = stats.get("ghl_recent_contacts", 0)
+    if ghl_opps or ghl_contacts:
+        lines.append("*GHL CRM Status:*")
+        if ghl_contacts:
+            lines.append(f"  Recent contacts: {ghl_contacts}")
+        if ghl_opps:
+            lines.append(f"  Open opportunities: {ghl_opps}")
+        lines.append("")
 
     # GHL export info
     created = stats.get("contacts_created", 0)
@@ -83,9 +103,11 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
             score = lead.get("lead_score", 0)
             industry = lead.get("industry", "")
             focus = lead.get("business_focus", "")
+            source = lead.get("source", "")
+            source_tag = f" [{source}]" if source else ""
             lines.append(
                 f"  {i}. {name} (Score: {score}) "
-                f"- {industry} - {focus}"
+                f"- {industry} - {focus}{source_tag}"
             )
 
     # Errors
