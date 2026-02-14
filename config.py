@@ -34,6 +34,16 @@ GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
 CLEARBIT_API_KEY = os.environ.get("CLEARBIT_API_KEY", "")
 
+# Google Ads (for campaign performance data via MCP)
+GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "")
+GOOGLE_ADS_CLIENT_ID = os.environ.get("GOOGLE_ADS_CLIENT_ID", "")
+GOOGLE_ADS_CLIENT_SECRET = os.environ.get("GOOGLE_ADS_CLIENT_SECRET", "")
+GOOGLE_ADS_REFRESH_TOKEN = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN", "")
+GOOGLE_ADS_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "")
+
+# Apify (web scraping — Google Maps business extraction)
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+
 # Notifications
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
@@ -75,7 +85,13 @@ HIGH_VALUE_INDUSTRIES = [
     "landscaping", "roofing", "electrical",
 ]
 
-# ── GHL MCP server configuration ──────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# MCP SERVER CONFIGURATIONS
+# ═══════════════════════════════════════════════════════════════
+# These can be used by any MCP-compatible client (Claude Desktop,
+# Claude Code, custom agents via Agent SDK, etc.)
+
+# GoHighLevel — CRM: contacts, conversations, calendars, opportunities
 GHL_MCP_CONFIG = {
     "command": "npx",
     "args": [
@@ -86,4 +102,45 @@ GHL_MCP_CONFIG = {
         "--header",
         f"locationId: {GHL_LOCATION_ID}",
     ],
+}
+
+# Google Ads — Campaign performance, keyword ideas, GAQL queries
+# Requires: google-ads-mcp-server npm package
+# Setup: https://github.com/google-marketing-solutions/google-ads-mcp-server
+GOOGLE_ADS_MCP_CONFIG = {
+    "command": "npx",
+    "args": ["google-ads-mcp-server"],
+    "env": {
+        "GOOGLE_ADS_DEVELOPER_TOKEN": GOOGLE_ADS_DEVELOPER_TOKEN,
+        "GOOGLE_ADS_CLIENT_ID": GOOGLE_ADS_CLIENT_ID,
+        "GOOGLE_ADS_CLIENT_SECRET": GOOGLE_ADS_CLIENT_SECRET,
+        "GOOGLE_ADS_REFRESH_TOKEN": GOOGLE_ADS_REFRESH_TOKEN,
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": GOOGLE_ADS_CUSTOMER_ID,
+    },
+}
+
+# Apify — 3,000+ web scraping actors (Google Maps, Yellow Pages, etc.)
+# Key actor: apify/google-maps-scraper for business discovery
+# Setup: https://github.com/apify/actors-mcp-server
+APIFY_MCP_CONFIG = {
+    "command": "npx",
+    "args": ["-y", "@anthropic-ai/apify-mcp-server"],
+    "env": {
+        "APIFY_TOKEN": APIFY_API_TOKEN,
+    },
+}
+
+# Playwright — Browser automation for scraping business directories
+# Setup: https://github.com/microsoft/playwright-mcp
+PLAYWRIGHT_MCP_CONFIG = {
+    "command": "npx",
+    "args": ["@anthropic-ai/playwright-mcp-server"],
+}
+
+# All MCP configs in one dict for easy iteration
+MCP_SERVERS = {
+    "ghl": GHL_MCP_CONFIG,
+    "google_ads": GOOGLE_ADS_MCP_CONFIG,
+    "apify": APIFY_MCP_CONFIG,
+    "playwright": PLAYWRIGHT_MCP_CONFIG,
 }
