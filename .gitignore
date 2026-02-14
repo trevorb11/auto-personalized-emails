@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Data files (keep schema, not actual data)
+data/ucc_filings.db
+data/ucc/*.csv
+data/ucc/processed/
+data/enriched/
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Replit (legacy)
+.replit
+replit.nix
