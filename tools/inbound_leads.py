@@ -41,22 +41,48 @@ CLEARBIT_API_KEY = os.environ.get("CLEARBIT_API_KEY", "")
 _TIMEOUT = 15.0
 
 # ── MCA-specific search queries ────────────────────────────────
-# These are designed to surface businesses likely to need funding
+# These are designed to surface businesses with funding intent signals.
+# Three tiers: (1) direct funding intent, (2) growth/expansion signals,
+# (3) cash-flow-intensive operations by industry.
 MCA_SEARCH_STRATEGIES = [
-    # Businesses actively seeking funding
+    # ── Tier 1: Direct funding intent ─────────────────────────
     '"{industry}" "{city}" "looking for funding" OR "need capital" OR "business loan"',
-    # Businesses in growth mode (high MCA demand)
-    '"{industry}" "{city}" "now hiring" OR "expanding" OR "new location"',
-    # Businesses with cash flow signals
-    '"{industry}" "{city}" "equipment financing" OR "working capital"',
-    # Find businesses by industry + location (broad)
-    '"{industry}" business "{city}" "{state}"',
-    # Trucking-specific (your #1 industry)
+    '"{industry}" "{city}" "working capital" OR "cash advance" OR "business financing"',
+    '"{industry}" "{city}" "equipment financing" OR "equipment lease" OR "fleet financing"',
+
+    # ── Tier 2: Growth / expansion signals ────────────────────
+    # Businesses hiring = growing = needing capital
+    '"{industry}" "{city}" "now hiring" OR "we are hiring" OR "join our team"',
+    # Expansion signals = new locations, franchises, renovations
+    '"{industry}" "{city}" "new location" OR "expanding" OR "grand opening" OR "coming soon"',
+    '"{industry}" "{city}" "franchise" OR "second location" OR "renovation"',
+
+    # ── Tier 3: Industry-specific high-cash-flow searches ─────
+    # Trucking (your #1 industry) — DOT/MC numbers = active carriers
     'trucking company "{city}" "{state}" DOT number MC authority',
-    # Construction-specific
-    'general contractor "{city}" "{state}" licensed bonded',
-    # Restaurant-specific
-    'restaurant "{city}" "{state}" yelp OR doordash',
+    'freight carrier "{city}" "{state}" hiring drivers OR "owner operator"',
+    '"{city}" "{state}" trucking "new trucks" OR "fleet" OR "expanding fleet"',
+
+    # Construction — licensed/bonded = active, bidding = need capital
+    'general contractor "{city}" "{state}" licensed bonded insured',
+    'construction company "{city}" "{state}" "hiring" OR "new project" OR "bidding"',
+
+    # Restaurant — DoorDash/UberEats presence = active
+    'restaurant "{city}" "{state}" yelp OR doordash OR ubereats',
+    'restaurant "{city}" "{state}" "grand opening" OR "new menu" OR "renovation"',
+
+    # Auto repair — high parts cost = cash flow need
+    'auto repair "{city}" "{state}" "ASE certified" OR "now hiring mechanics"',
+
+    # Healthcare / dental — insurance billing gaps = cash flow strain
+    'medical practice "{city}" "{state}" "accepting patients" OR "now open"',
+    'dental office "{city}" "{state}" "new patients" OR "expanding"',
+
+    # Landscaping — seasonal + equipment-heavy
+    'landscaping company "{city}" "{state}" "hiring" OR "new equipment" OR "commercial"',
+
+    # ── Tier 4: General business by industry + location ───────
+    '"{industry}" business "{city}" "{state}"',
 ]
 
 
@@ -125,23 +151,38 @@ async def discover_businesses(
 
     # Pick relevant search strategies
     strategies = []
+    ind_lower = industry.lower()
+
+    # Industry keyword mapping for matching specialized templates
+    industry_matches = {
+        "truck": ["trucking", "freight", "carrier"],
+        "construct": ["contractor", "construction"],
+        "restaurant": ["restaurant"],
+        "auto": ["auto repair"],
+        "medical": ["medical practice"],
+        "dental": ["dental"],
+        "landscap": ["landscaping"],
+    }
+
     for template in MCA_SEARCH_STRATEGIES:
         if "{industry}" in template:
             strategies.append(
                 template.format(industry=industry, city=city, state=state)
             )
-        elif "trucking" in template and "truck" in industry.lower():
-            strategies.append(template.format(city=city, state=state))
-        elif "contractor" in template and "construct" in industry.lower():
-            strategies.append(template.format(city=city, state=state))
-        elif "restaurant" in template and "restaurant" in industry.lower():
-            strategies.append(template.format(city=city, state=state))
+        else:
+            # Check if this industry-specific template matches our industry
+            for ind_key, template_keywords in industry_matches.items():
+                if ind_key in ind_lower:
+                    if any(kw in template.lower() for kw in template_keywords):
+                        strategies.append(template.format(city=city, state=state))
+                        break
 
-    # If no industry-specific strategies matched, use the broad one
+    # If no strategies matched, use the broad one
     if not strategies:
         strategies = [f'"{industry}" business "{city}" "{state}"']
 
-    for query in strategies[:3]:  # Limit to 3 queries to control API costs
+    # Prioritize intent-signal queries (tiers 1-2) over broad ones
+    for query in strategies[:4]:  # Up to 4 queries for better coverage
         results = await search_google_cse(query, num_results=10)
 
         for r in results:
@@ -475,17 +516,18 @@ def get_mca_search_targets(
         "PA": ["Philadelphia", "Pittsburgh", "Allentown", "Erie", "Reading"],
     }
 
-    # Top industries by MCA funding volume
+    # Top industries by MCA funding volume and intent-signal density
     top_industries = [
         "trucking", "construction", "restaurant", "auto repair",
-        "healthcare", "retail", "manufacturing", "landscaping",
+        "healthcare", "dental", "retail", "manufacturing",
+        "landscaping", "plumbing", "hvac", "roofing",
     ]
 
     targets = []
     for state in states:
         cities = state_cities.get(state, [f"{state} businesses"])[:cities_per_state]
         for city in cities:
-            for industry in top_industries[:4]:  # Top 4 per city to limit API costs
+            for industry in top_industries[:6]:  # Top 6 per city for broader reach
                 targets.append({
                     "industry": industry,
                     "city": city,
