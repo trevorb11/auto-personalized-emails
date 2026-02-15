@@ -95,7 +95,8 @@ echo "→ Environment configuration..."
 
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
-    echo "  Created .env from .env.example"
+    chmod 600 "$PROJECT_DIR/.env"
+    echo "  Created .env from .env.example (permissions: owner-only)"
     echo ""
     echo "  ╔══════════════════════════════════════════════╗"
     echo "  ║  IMPORTANT: Edit .env with your API keys    ║"
@@ -107,7 +108,9 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "  ║    GHL_LOCATION_ID                           ║"
     echo "  ╚══════════════════════════════════════════════╝"
 else
-    echo "  ✓ .env already exists"
+    # Ensure permissions are locked down even if .env already exists
+    chmod 600 "$PROJECT_DIR/.env"
+    echo "  ✓ .env already exists (permissions: owner-only)"
 fi
 
 # ── 4. Initialize database ──────────────────────────────────
