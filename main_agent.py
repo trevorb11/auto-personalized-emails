@@ -108,6 +108,7 @@ async def process_state_filings(
     state: str,
     batch_date: str,
     google_lookups_remaining: int,
+    days_back: int = 7,
 ) -> tuple[list[dict], int]:
     """
     Process UCC filings for a single state:
@@ -120,22 +121,25 @@ async def process_state_filings(
     leads = []
     lookups_used = 0
 
-    result = process_ucc_filings(state=state, days_back=7)
+    result = process_ucc_filings(state=state, days_back=days_back)
     filings = result.get("filings", [])
     logger.info(
         f"  {state}: {result['total_filings']} filings, "
         f"{result['mca_filings']} MCA, "
-        f"{result['in_renewal_window']} in renewal window"
+        f"{result['in_renewal_window']} in renewal window, "
+        f"{result.get('stacked_merchants', 0)} stacked"
     )
 
     if not filings:
         return leads, lookups_used
 
     for filing in filings:
+        # Start with basic filing fields
         lead_data = {
             "filing_id": filing.get("filing_id"),
             "source": "ucc",
             "business_name": filing.get("business_name"),
+            "secured_party": filing.get("secured_party", ""),
             "address": filing.get("address"),
             "city": filing.get("city"),
             "state": filing.get("state"),
@@ -143,6 +147,25 @@ async def process_state_filings(
             "has_existing_mca": filing.get("is_mca_lender", False),
             "ucc_filing_age_months": filing.get("filing_age_months"),
             "batch_date": batch_date,
+            # ── Funder intelligence from UCC processor ────────
+            "funder_display_name": filing.get("funder_display_name", ""),
+            "funder_tier": filing.get("funder_tier"),
+            "funder_weakness": filing.get("funder_weakness", ""),
+            "funder_positioning": filing.get("funder_positioning", ""),
+            "funder_sweet_spot": filing.get("funder_sweet_spot", ""),
+            "urgency": filing.get("urgency", {}),
+            # ── Payment estimates ─────────────────────────────
+            "estimated_advance": filing.get("estimated_advance", 0),
+            "estimated_factor_rate": filing.get("estimated_factor_rate", 0),
+            "estimated_daily_payment": filing.get("estimated_daily_payment", 0),
+            "estimated_monthly_obligation": filing.get("estimated_monthly_obligation", 0),
+            "estimated_remaining_balance": filing.get("estimated_remaining_balance", 0),
+            "estimated_months_remaining": filing.get("estimated_months_remaining", 0),
+            "estimated_payoff_date": filing.get("estimated_payoff_date", ""),
+            # ── Stacking intelligence ─────────────────────────
+            "position_count": filing.get("position_count", 1),
+            "other_funders": filing.get("other_funders", []),
+            "is_stacked": filing.get("is_stacked", False),
         }
 
         # Enrich via Google Maps (rate-limited)
@@ -178,7 +201,6 @@ async def process_state_filings(
 
         # Generate outreach for A/B-tier
         if score_result["tier"] in ("A", "B"):
-            lead_data["secured_party"] = filing.get("secured_party", "")
             email = generate_outreach_email(lead_data)
             lead_data["personalized_message"] = (
                 f"Subject: {email['subject']}\n\n{email['body']}"
@@ -372,18 +394,20 @@ async def run_daily_prospecting(
     dry_run: bool | None = None,
     skip_inbound: bool = False,
     skip_ghl_sync: bool = False,
+    days_back: int = 7,
 ) -> None:
     """Main daily prospecting workflow."""
+    import config as _cfg
+
     if states is None:
         states = TARGET_STATES
     if dry_run is not None:
-        import config
-        config.DRY_RUN = dry_run
+        _cfg.DRY_RUN = dry_run
 
     batch_date = datetime.now().strftime("%Y-%m-%d")
     logger.info(f"{'='*60}")
     logger.info(f"MCA Prospecting Agent - {batch_date}")
-    logger.info(f"States: {states} | Dry run: {DRY_RUN}")
+    logger.info(f"States: {states} | Dry run: {_cfg.DRY_RUN}")
     logger.info(f"{'='*60}")
 
     init_db()
@@ -417,6 +441,7 @@ async def run_daily_prospecting(
                     state=state,
                     batch_date=batch_date,
                     google_lookups_remaining=remaining_lookups,
+                    days_back=days_back,
                 )
                 all_leads.extend(leads)
                 total_google_lookups += lookups
@@ -560,12 +585,17 @@ def main():
     elif args.no_dry_run:
         dry_run = False
 
-    asyncio.run(run_daily_prospecting(
-        states=states,
-        dry_run=dry_run,
-        skip_inbound=args.skip_inbound,
-        skip_ghl_sync=args.skip_ghl_sync,
-    ))
+    try:
+        asyncio.run(run_daily_prospecting(
+            states=states,
+            dry_run=dry_run,
+            skip_inbound=args.skip_inbound,
+            skip_ghl_sync=args.skip_ghl_sync,
+            days_back=args.days_back,
+        ))
+    except Exception as e:
+        logging.getLogger("mca-agent").error(f"Fatal: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

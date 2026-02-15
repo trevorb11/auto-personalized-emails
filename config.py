@@ -1,9 +1,14 @@
 """
 Configuration for MCA Prospecting Agent.
-All secrets loaded from environment variables.
+All secrets loaded from environment variables (auto-loaded from .env).
 """
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root (no-op if file doesn't exist)
+load_dotenv(Path(__file__).parent / ".env")
 
 # ── Project paths ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
