@@ -18,6 +18,7 @@ data/ucc_filings.db
 data/ucc/*.csv
 data/ucc/processed/
 data/enriched/
+data/backups/
 
 # Logs
 logs/*.log

@@ -37,6 +37,19 @@ else
     exit 1
 fi
 
+# ── Backup database before run ─────────────────────────────
+DB_FILE="$PROJECT_DIR/data/ucc_filings.db"
+BACKUP_DIR="$PROJECT_DIR/data/backups"
+mkdir -p "$BACKUP_DIR"
+
+if [ -f "$DB_FILE" ]; then
+    BACKUP_FILE="$BACKUP_DIR/ucc_filings_$(date +%Y-%m-%d).db"
+    sqlite3 "$DB_FILE" ".backup '$BACKUP_FILE'"
+    log "DB backed up to $BACKUP_FILE"
+    # Keep 7 days of backups
+    find "$BACKUP_DIR" -name "*.db" -mtime +7 -delete 2>/dev/null || true
+fi
+
 # ── Run the pipeline ────────────────────────────────────────
 log "Starting MCA pipeline"
 log "Args: $*"

@@ -23,6 +23,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import GHL_API_KEY, GHL_LOCATION_ID, GHL_BASE_URL, DRY_RUN
+from tools.http_retry import fetch
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ async def search_contacts(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/contacts/",
                 headers=_headers(),
                 params={
@@ -86,7 +87,7 @@ async def get_contact(contact_id: str) -> Optional[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/contacts/{contact_id}",
                 headers=_headers(),
             )
@@ -113,7 +114,7 @@ async def list_contacts(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/contacts/",
                 headers=_headers(),
                 params={
@@ -143,7 +144,7 @@ async def get_contacts_by_tag(tag: str, limit: int = 100) -> list[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/contacts/",
                 headers=_headers(),
                 params={
@@ -260,7 +261,7 @@ async def create_contact(lead: dict) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.post(
+            resp = await fetch(client, "POST",
                 f"{GHL_BASE_URL}/contacts/",
                 headers=_headers(),
                 json=payload,
@@ -293,7 +294,7 @@ async def update_contact(contact_id: str, fields: dict) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.put(
+            resp = await fetch(client, "PUT",
                 f"{GHL_BASE_URL}/contacts/{contact_id}",
                 headers=_headers(),
                 json=fields,
@@ -323,7 +324,7 @@ async def add_contact_note(contact_id: str, body: str) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.post(
+            resp = await fetch(client, "POST",
                 f"{GHL_BASE_URL}/contacts/{contact_id}/notes",
                 headers=_headers(),
                 json={"body": body, "userId": GHL_LOCATION_ID},
@@ -346,7 +347,7 @@ async def list_pipelines() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/opportunities/pipelines",
                 headers=_headers(),
                 params={"locationId": GHL_LOCATION_ID},
@@ -386,7 +387,7 @@ async def list_opportunities(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/opportunities/search",
                 headers=_headers(),
                 params=params,
@@ -410,7 +411,7 @@ async def get_opportunity(opportunity_id: str) -> Optional[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/opportunities/{opportunity_id}",
                 headers=_headers(),
             )
@@ -450,7 +451,7 @@ async def create_opportunity(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.post(
+            resp = await fetch(client, "POST",
                 f"{GHL_BASE_URL}/opportunities/",
                 headers=_headers(),
                 json=payload,
@@ -478,7 +479,7 @@ async def list_conversations(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/conversations/search",
                 headers=_headers(),
                 params={
@@ -506,7 +507,7 @@ async def get_conversation_messages(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/conversations/{conversation_id}/messages",
                 headers=_headers(),
                 params={"limit": limit},
@@ -525,7 +526,7 @@ async def get_contact_conversations(contact_id: str) -> list[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/conversations/search",
                 headers=_headers(),
                 params={
@@ -551,7 +552,7 @@ async def list_calendars() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/calendars/",
                 headers=_headers(),
                 params={"locationId": GHL_LOCATION_ID},
@@ -587,7 +588,7 @@ async def list_appointments(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"{GHL_BASE_URL}/calendars/events",
                 headers=_headers(),
                 params=params,

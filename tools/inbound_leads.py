@@ -27,6 +27,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import HIGH_VALUE_INDUSTRIES
+from tools.http_retry import fetch
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ async def search_google_cse(
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 "https://www.googleapis.com/customsearch/v1",
                 params={
                     "key": GOOGLE_CSE_API_KEY,
@@ -218,7 +219,7 @@ async def find_emails_hunter(domain: str) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 "https://api.hunter.io/v2/domain-search",
                 params={
                     "domain": domain,
@@ -263,7 +264,7 @@ async def verify_email_hunter(email: str) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 "https://api.hunter.io/v2/email-verifier",
                 params={
                     "email": email,
@@ -300,7 +301,7 @@ async def enrich_company_clearbit(domain: str) -> dict:
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.get(
+            resp = await fetch(client, "GET",
                 f"https://company.clearbit.com/v2/companies/find",
                 headers={"Authorization": f"Bearer {CLEARBIT_API_KEY}"},
                 params={"domain": domain},

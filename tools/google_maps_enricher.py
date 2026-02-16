@@ -19,6 +19,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import GOOGLE_MAPS_API_KEY
+from tools.http_retry import fetch
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ async def enrich_business_google(
     async with httpx.AsyncClient(timeout=15.0) as client:
         # Step 1: Find Place
         try:
-            search_resp = await client.get(
+            search_resp = await fetch(client, "GET",
                 "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
                 params={
                     "input": query,
@@ -70,7 +71,7 @@ async def enrich_business_google(
         # Step 2: Get Place Details
         place_id = candidates[0]["place_id"]
         try:
-            details_resp = await client.get(
+            details_resp = await fetch(client, "GET",
                 "https://maps.googleapis.com/maps/api/place/details/json",
                 params={
                     "place_id": place_id,

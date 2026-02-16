@@ -13,6 +13,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import SLACK_WEBHOOK_URL
+from tools.http_retry import fetch
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ async def send_slack_message(text: str) -> bool:
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.post(
+            resp = await fetch(client, "POST",
                 SLACK_WEBHOOK_URL,
                 json={"text": text},
             )
