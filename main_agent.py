@@ -22,8 +22,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Load .env so API keys are always available
+load_dotenv(Path(__file__).parent / ".env")
 
 from config import (
     TARGET_STATES, DRY_RUN, DAILY_GHL_CREATES,
