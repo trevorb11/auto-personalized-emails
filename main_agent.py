@@ -41,6 +41,7 @@ from data.database import (
     get_leads_by_tier, mark_lead_exported,
     start_daily_run, complete_daily_run,
     is_domain_known, record_domain,
+    is_phone_known,
     save_ghl_snapshot, sync_opportunities,
 )
 from tools.ucc_processor import process_ucc_filings
@@ -233,17 +234,19 @@ async def process_state_filings(
 async def run_inbound_discovery(
     states: list[str],
     batch_date: str,
-    max_targets: int = 4,
+    max_targets: int = 12,
 ) -> list[dict]:
     """
-    Discover new leads via Google CSE + Hunter.io + Clearbit.
-    Skips domains we've already seen. Scores and generates outreach.
+    Discover new leads via Google Maps (primary) or CSE (fallback)
+    + Hunter.io + Clearbit enrichment.
+    Skips domains and phone numbers we've already seen.
+    Scores and generates outreach for qualified leads.
     """
     logger.info("=== Phase 2: Inbound Lead Discovery ===")
     all_inbound_leads = []
 
     # Get search targets (industry + city combos)
-    targets = get_mca_search_targets(states, cities_per_state=2)
+    targets = get_mca_search_targets(states, cities_per_state=3)
 
     # Limit to control API spend
     targets = targets[:max_targets]
@@ -257,16 +260,22 @@ async def run_inbound_discovery(
                 industry=target["industry"],
                 city=target["city"],
                 state=target["state"],
-                max_leads=5,
+                max_leads=15,
                 enrich=True,
             )
 
             for lead in raw_leads:
                 domain = lead.get("domain", "")
+                phone = lead.get("phone", "")
 
                 # Skip already-known domains
                 if domain and is_domain_known(conn, domain):
                     logger.info(f"  Skipping known domain: {domain}")
+                    continue
+
+                # Skip already-known phone numbers (for Maps leads without domains)
+                if not domain and phone and is_phone_known(conn, phone):
+                    logger.info(f"  Skipping known phone: {phone}")
                     continue
 
                 # Add source and batch info
@@ -461,7 +470,7 @@ async def run_daily_prospecting(
                 inbound_leads = await run_inbound_discovery(
                     states=states,
                     batch_date=batch_date,
-                    max_targets=4,
+                    max_targets=12,
                 )
                 all_leads.extend(inbound_leads)
             except Exception as e:

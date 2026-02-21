@@ -421,6 +421,26 @@ def get_undiscovered_count(conn: sqlite3.Connection) -> int:
     return row["cnt"] if row else 0
 
 
+def is_phone_known(conn: sqlite3.Connection, phone: str) -> bool:
+    """Check if a phone number already exists in the leads table.
+
+    Used for dedup of Maps-discovered leads that don't have a website/domain.
+    """
+    if not phone:
+        return False
+    # Normalize: strip non-digit characters for comparison
+    digits = "".join(c for c in phone if c.isdigit())
+    if len(digits) < 7:
+        return False
+    # Check leads table — match on last 10 digits to handle format differences
+    suffix = digits[-10:]
+    row = conn.execute(
+        "SELECT 1 FROM leads WHERE phone IS NOT NULL AND phone LIKE ?",
+        (f"%{suffix}",)
+    ).fetchone()
+    return row is not None
+
+
 # ═══════════════════════════════════════════════════════════════
 # GHL SNAPSHOTS
 # ═══════════════════════════════════════════════════════════════

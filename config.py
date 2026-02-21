@@ -63,6 +63,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 DAILY_GHL_CREATES = int(os.environ.get("DAILY_GHL_CREATES", "100"))
 DAILY_GOOGLE_LOOKUPS = int(os.environ.get("DAILY_GOOGLE_LOOKUPS", "200"))
 DAILY_CSE_SEARCHES = int(os.environ.get("DAILY_CSE_SEARCHES", "50"))
+DAILY_MAPS_DISCOVERY = int(os.environ.get("DAILY_MAPS_DISCOVERY", "100"))
 DAILY_HUNTER_LOOKUPS = int(os.environ.get("DAILY_HUNTER_LOOKUPS", "25"))
 DAILY_CLEARBIT_LOOKUPS = int(os.environ.get("DAILY_CLEARBIT_LOOKUPS", "50"))
 DAILY_CLAUDE_TOKENS = int(os.environ.get("DAILY_CLAUDE_TOKENS", "500000"))

@@ -15,8 +15,10 @@ Setup:
   2. Hunter.io: hunter.io/api → free tier = 25 searches/mo
   3. Clearbit: clearbit.com/docs → company enrichment API
 """
+import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,8 +34,7 @@ from tools.http_retry import fetch
 logger = logging.getLogger(__name__)
 
 # API keys loaded from environment at import time
-import os
-
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 GOOGLE_CSE_API_KEY = os.environ.get("GOOGLE_CSE_API_KEY", "")
 GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
@@ -86,9 +87,235 @@ MCA_SEARCH_STRATEGIES = [
     '"{industry}" business "{city}" "{state}"',
 ]
 
+# ── Google Maps Text Search query templates ───────────────────
+# These return ACTUAL BUSINESSES (not web pages) from Google Maps.
+# Much higher signal-to-noise ratio than CSE for lead discovery.
+MAPS_SEARCH_QUERIES = {
+    "trucking": [
+        "trucking companies in {city}, {state}",
+        "freight carriers in {city}, {state}",
+        "logistics companies in {city}, {state}",
+    ],
+    "construction": [
+        "construction companies in {city}, {state}",
+        "general contractors in {city}, {state}",
+    ],
+    "restaurant": [
+        "restaurants in {city}, {state}",
+    ],
+    "auto repair": [
+        "auto repair shops in {city}, {state}",
+        "auto body shops in {city}, {state}",
+    ],
+    "healthcare": [
+        "medical clinics in {city}, {state}",
+        "medical practices in {city}, {state}",
+    ],
+    "dental": [
+        "dental offices in {city}, {state}",
+        "dentists in {city}, {state}",
+    ],
+    "retail": [
+        "retail stores in {city}, {state}",
+    ],
+    "manufacturing": [
+        "manufacturing companies in {city}, {state}",
+    ],
+    "landscaping": [
+        "landscaping companies in {city}, {state}",
+    ],
+    "plumbing": [
+        "plumbing companies in {city}, {state}",
+    ],
+    "hvac": [
+        "HVAC companies in {city}, {state}",
+    ],
+    "roofing": [
+        "roofing companies in {city}, {state}",
+    ],
+}
+
 
 # ═══════════════════════════════════════════════════════════════
-# GOOGLE CUSTOM SEARCH ENGINE
+# GOOGLE MAPS — PLACES TEXT SEARCH (PRIMARY DISCOVERY)
+# ═══════════════════════════════════════════════════════════════
+
+async def search_google_maps_places(
+    query: str,
+    max_pages: int = 1,
+) -> list[dict]:
+    """
+    Search Google Maps via Places Text Search API.
+
+    Returns actual businesses (not web pages) with:
+    name, address, place_id, rating, review_count, types, business_status.
+
+    Each page returns up to 20 results. max_pages=3 yields up to 60 results.
+    Note: Google requires ~2s delay between page requests.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        logger.warning("GOOGLE_MAPS_API_KEY not configured for discovery")
+        return []
+
+    all_results = []
+    next_page_token = None
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        for page in range(max_pages):
+            try:
+                params = {"key": GOOGLE_MAPS_API_KEY}
+
+                if next_page_token:
+                    params["pagetoken"] = next_page_token
+                    # Google requires ~2s delay before using next_page_token
+                    await asyncio.sleep(2.0)
+                else:
+                    params["query"] = query
+
+                resp = await fetch(client, "GET",
+                    "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                    params=params,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                if data.get("status") not in ("OK", "ZERO_RESULTS"):
+                    logger.error(f"Maps Text Search status: {data.get('status')} - {data.get('error_message', '')}")
+                    break
+
+                for r in data.get("results", []):
+                    all_results.append({
+                        "name": r.get("name", ""),
+                        "address": r.get("formatted_address", ""),
+                        "place_id": r.get("place_id", ""),
+                        "rating": r.get("rating", 0),
+                        "review_count": r.get("user_ratings_total", 0),
+                        "types": r.get("types", []),
+                        "business_status": r.get("business_status", ""),
+                    })
+
+                next_page_token = data.get("next_page_token")
+                if not next_page_token:
+                    break
+
+            except httpx.HTTPError as e:
+                logger.error(f"Google Maps Text Search failed: {e}")
+                break
+
+    return all_results
+
+
+async def get_place_contact_details(place_id: str) -> dict:
+    """
+    Get phone number and website for a business via Google Places Details API.
+
+    This is a separate API call per business — use selectively.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return {}
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        try:
+            resp = await fetch(client, "GET",
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={
+                    "place_id": place_id,
+                    "fields": "formatted_phone_number,website",
+                    "key": GOOGLE_MAPS_API_KEY,
+                },
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            return {
+                "phone": result.get("formatted_phone_number", ""),
+                "website": result.get("website", ""),
+            }
+        except httpx.HTTPError as e:
+            logger.error(f"Place details failed for {place_id}: {e}")
+            return {}
+
+
+async def _discover_via_maps(
+    industry: str,
+    city: str,
+    state: str,
+    max_results: int,
+) -> list[dict]:
+    """
+    Discover businesses via Google Maps Places Text Search, then
+    fetch contact details (phone/website) for each result.
+
+    Returns list of dicts in the same format as CSE discovery
+    (title, link, snippet, domain) plus Maps-specific fields
+    (phone, rating, review_count, types, place_id, source_method).
+    """
+    ind_lower = industry.lower()
+    templates = MAPS_SEARCH_QUERIES.get(ind_lower)
+    if not templates:
+        templates = [f"{industry} companies in {{city}}, {{state}}"]
+
+    all_results = []
+    seen_place_ids = set()
+
+    for template in templates[:2]:  # Max 2 queries per industry+city
+        query = template.format(city=city, state=state)
+
+        pages_needed = min(3, max(1, (max_results - len(all_results) + 19) // 20))
+        raw_results = await search_google_maps_places(query, max_pages=pages_needed)
+
+        for r in raw_results:
+            place_id = r.get("place_id", "")
+            if place_id in seen_place_ids:
+                continue
+            seen_place_ids.add(place_id)
+
+            # Skip permanently closed businesses
+            if r.get("business_status") == "CLOSED_PERMANENTLY":
+                continue
+
+            all_results.append(r)
+            if len(all_results) >= max_results:
+                break
+
+        if len(all_results) >= max_results:
+            break
+
+    if not all_results:
+        return []
+
+    # Fetch contact details (phone + website) for each business
+    normalized = []
+    for r in all_results:
+        details = await get_place_contact_details(r["place_id"])
+
+        website = details.get("website", "")
+        domain = urlparse(website).netloc if website else ""
+
+        normalized.append({
+            # Standard fields (compatible with CSE format)
+            "title": r["name"],
+            "link": website,
+            "snippet": r.get("address", ""),
+            "domain": domain,
+            # Maps-specific fields
+            "phone": details.get("phone", ""),
+            "rating": r.get("rating", 0),
+            "review_count": r.get("review_count", 0),
+            "types": r.get("types", []),
+            "place_id": r.get("place_id", ""),
+            "business_status": r.get("business_status", ""),
+            "source_method": "google_maps",
+        })
+
+    logger.info(
+        f"Maps discovery: {len(normalized)} businesses "
+        f"for {industry} in {city}, {state}"
+    )
+    return normalized
+
+
+# ═══════════════════════════════════════════════════════════════
+# GOOGLE CUSTOM SEARCH ENGINE (FALLBACK)
 # ═══════════════════════════════════════════════════════════════
 
 async def search_google_cse(
@@ -142,11 +369,32 @@ async def discover_businesses(
     max_results: int = 20,
 ) -> list[dict]:
     """
-    Discover businesses in a specific industry and location
-    using targeted Google CSE queries.
+    Discover businesses in a specific industry and location.
+
+    Primary: Google Maps Places Text Search (returns real businesses
+    with structured data — name, address, phone, rating, reviews).
+    Fallback: Google CSE (returns web pages to be parsed).
 
     Returns a list of business leads with available contact info.
     """
+    # ── Primary: Google Maps Text Search ──────────────────────
+    if GOOGLE_MAPS_API_KEY:
+        maps_results = await _discover_via_maps(industry, city, state, max_results)
+        if maps_results:
+            return maps_results
+        logger.info("Maps returned 0 results, falling back to CSE")
+
+    # ── Fallback: Google CSE ──────────────────────────────────
+    return await _discover_via_cse(industry, city, state, max_results)
+
+
+async def _discover_via_cse(
+    industry: str,
+    city: str,
+    state: str,
+    max_results: int,
+) -> list[dict]:
+    """Fallback discovery via Google Custom Search Engine (web pages)."""
     all_results = []
     seen_domains = set()
 
@@ -154,7 +402,6 @@ async def discover_businesses(
     strategies = []
     ind_lower = industry.lower()
 
-    # Industry keyword mapping for matching specialized templates
     industry_matches = {
         "truck": ["trucking", "freight", "carrier"],
         "construct": ["contractor", "construction"],
@@ -171,24 +418,20 @@ async def discover_businesses(
                 template.format(industry=industry, city=city, state=state)
             )
         else:
-            # Check if this industry-specific template matches our industry
             for ind_key, template_keywords in industry_matches.items():
                 if ind_key in ind_lower:
                     if any(kw in template.lower() for kw in template_keywords):
                         strategies.append(template.format(city=city, state=state))
                         break
 
-    # If no strategies matched, use the broad one
     if not strategies:
         strategies = [f'"{industry}" business "{city}" "{state}"']
 
-    # Prioritize intent-signal queries (tiers 1-2) over broad ones
-    for query in strategies[:4]:  # Up to 4 queries for better coverage
+    for query in strategies[:4]:
         results = await search_google_cse(query, num_results=10)
 
         for r in results:
             domain = r.get("domain", "")
-            # Deduplicate by domain
             if domain and domain not in seen_domains:
                 seen_domains.add(domain)
                 all_results.append(r)
@@ -196,7 +439,7 @@ async def discover_businesses(
         if len(all_results) >= max_results:
             break
 
-    logger.info(f"Discovered {len(all_results)} businesses for {industry} in {city}, {state}")
+    logger.info(f"CSE fallback: {len(all_results)} results for {industry} in {city}, {state}")
     return all_results[:max_results]
 
 
@@ -363,8 +606,8 @@ async def discover_and_enrich(
 ) -> list[dict]:
     """
     Full inbound lead discovery pipeline:
-      1. Google CSE → find businesses by industry + location
-      2. Hunter.io → find decision-maker emails for each domain
+      1. Google Maps Text Search (primary) or CSE (fallback) → find businesses
+      2. Hunter.io → find decision-maker emails (if domain available)
       3. Clearbit → enrich with revenue, employee count, industry data
 
     Returns a list of enriched lead dicts ready for scoring and GHL.
@@ -378,7 +621,10 @@ async def discover_and_enrich(
     leads = []
     for result in search_results:
         domain = result.get("domain", "")
-        if not domain:
+        phone = result.get("phone", "")
+
+        # Need at least a domain or phone to be a useful lead
+        if not domain and not phone:
             continue
 
         lead = {
@@ -393,46 +639,62 @@ async def discover_and_enrich(
             "discovered_at": datetime.now().isoformat(),
         }
 
+        # Carry over Maps-specific data if present
+        if result.get("source_method") == "google_maps":
+            lead["phone"] = phone
+            lead["google_rating"] = result.get("rating", 0)
+            lead["google_review_count"] = result.get("review_count", 0)
+            lead["monthly_revenue"] = _estimate_revenue_from_reviews(
+                result.get("review_count", 0)
+            )
+            lead["address"] = result.get("snippet", "")  # Maps snippet is address
+
+            # Infer industry from Google types if available
+            inferred = _infer_industry_from_types(result.get("types", []))
+            if inferred:
+                lead["industry"] = inferred
+
         if not enrich:
             leads.append(lead)
             continue
 
-        # Step 2: Find emails via Hunter.io
-        hunter_data = await find_emails_hunter(domain)
-        if hunter_data.get("emails"):
-            # Prefer owner/founder/CEO, then generic emails
-            best_email = _pick_best_email(hunter_data["emails"])
-            if best_email:
-                lead["email"] = best_email["value"]
-                lead["first_name"] = best_email.get("first_name", "")
-                lead["last_name"] = best_email.get("last_name", "")
-                lead["contact_position"] = best_email.get("position", "")
-                lead["email_confidence"] = best_email.get("confidence", 0)
+        # Step 2: Find emails via Hunter.io (only if we have a domain)
+        if domain:
+            hunter_data = await find_emails_hunter(domain)
+            if hunter_data.get("emails"):
+                best_email = _pick_best_email(hunter_data["emails"])
+                if best_email:
+                    lead["email"] = best_email["value"]
+                    lead["first_name"] = best_email.get("first_name", "")
+                    lead["last_name"] = best_email.get("last_name", "")
+                    lead["contact_position"] = best_email.get("position", "")
+                    lead["email_confidence"] = best_email.get("confidence", 0)
 
-        if hunter_data.get("organization"):
-            lead["business_name"] = hunter_data["organization"]
+            if hunter_data.get("organization"):
+                lead["business_name"] = hunter_data["organization"]
 
-        # Step 3: Enrich via Clearbit
-        clearbit_data = await enrich_company_clearbit(domain)
-        if clearbit_data.get("found"):
-            lead["business_name"] = clearbit_data.get("name") or lead["business_name"]
-            lead["industry"] = clearbit_data.get("sub_industry") or clearbit_data.get("industry") or industry
-            lead["employee_count"] = clearbit_data.get("employee_count", 0)
-            lead["estimated_annual_revenue"] = clearbit_data.get("estimated_annual_revenue", "")
-            lead["phone"] = clearbit_data.get("phone", "") or lead.get("phone", "")
-            lead["description"] = clearbit_data.get("description", "")
-            lead["linkedin"] = clearbit_data.get("linkedin_handle", "")
-            lead["founded_year"] = clearbit_data.get("founded_year")
+        # Step 3: Enrich via Clearbit (only if we have a domain)
+        if domain:
+            clearbit_data = await enrich_company_clearbit(domain)
+            if clearbit_data.get("found"):
+                lead["business_name"] = clearbit_data.get("name") or lead["business_name"]
+                lead["industry"] = clearbit_data.get("sub_industry") or clearbit_data.get("industry") or lead.get("industry", industry)
+                lead["employee_count"] = clearbit_data.get("employee_count", 0)
+                lead["estimated_annual_revenue"] = clearbit_data.get("estimated_annual_revenue", "")
+                lead["phone"] = clearbit_data.get("phone", "") or lead.get("phone", "")
+                lead["description"] = clearbit_data.get("description", "")
+                lead["linkedin"] = clearbit_data.get("linkedin_handle", "")
+                lead["founded_year"] = clearbit_data.get("founded_year")
 
-            # Convert annual revenue to monthly for scoring
-            annual = clearbit_data.get("estimated_annual_revenue", "")
-            if annual:
-                lead["monthly_revenue"] = _annual_to_monthly_str(annual)
+                # Convert annual revenue to monthly for scoring
+                annual = clearbit_data.get("estimated_annual_revenue", "")
+                if annual:
+                    lead["monthly_revenue"] = _annual_to_monthly_str(annual)
 
-            # Estimate years in business
-            founded = clearbit_data.get("founded_year")
-            if founded:
-                lead["years_in_business"] = datetime.now().year - founded
+                # Estimate years in business
+                founded = clearbit_data.get("founded_year")
+                if founded:
+                    lead["years_in_business"] = datetime.now().year - founded
 
         leads.append(lead)
 
@@ -491,6 +753,53 @@ def _annual_to_monthly_str(annual_str: str) -> str:
             return f"${monthly:,.0f}/mo"
     except (ValueError, TypeError):
         return ""
+
+
+def _estimate_revenue_from_reviews(review_count: int) -> str:
+    """Rough monthly revenue estimate based on Google Maps review count."""
+    if review_count >= 500:
+        return "$100K+/mo"
+    elif review_count >= 200:
+        return "$50K-$100K/mo"
+    elif review_count >= 100:
+        return "$25K-$50K/mo"
+    elif review_count >= 50:
+        return "$15K-$30K/mo"
+    elif review_count >= 20:
+        return "$10K-$20K/mo"
+    else:
+        return "Under $10K/mo"
+
+
+def _infer_industry_from_types(google_types: list[str]) -> str:
+    """Map Google Places types to MCA-relevant industry names."""
+    type_map = {
+        "restaurant": "restaurant",
+        "food": "restaurant",
+        "meal_delivery": "restaurant",
+        "car_repair": "auto repair",
+        "car_dealer": "auto dealer",
+        "general_contractor": "construction",
+        "plumber": "plumbing",
+        "electrician": "electrical",
+        "roofing_contractor": "roofing",
+        "moving_company": "transportation",
+        "trucking_company": "trucking",
+        "dentist": "dental",
+        "doctor": "healthcare",
+        "health": "healthcare",
+        "pharmacy": "healthcare",
+        "store": "retail",
+        "beauty_salon": "beauty",
+        "hair_care": "beauty",
+        "gym": "fitness",
+        "lodging": "hospitality",
+        "gas_station": "gas station",
+    }
+    for gtype in google_types:
+        if gtype in type_map:
+            return type_map[gtype]
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════
