@@ -19,8 +19,23 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import GOOGLE_MAPS_API_KEY
+from tools.api_budget import try_consume
+from tools.parsing import normalize_business_name
 
 logger = logging.getLogger(__name__)
+
+
+def _names_match(expected: str, found: str) -> bool:
+    """
+    Guard against Places returning a different business (it always returns
+    *something*). Require most of the expected name's words to appear.
+    """
+    expected_words = set(normalize_business_name(expected).split())
+    found_words = set(normalize_business_name(found).split())
+    if not expected_words or not found_words:
+        return False
+    overlap = len(expected_words & found_words)
+    return overlap / len(expected_words) >= 0.5
 
 
 async def enrich_business_google(
@@ -43,6 +58,9 @@ async def enrich_business_google(
     if not GOOGLE_MAPS_API_KEY:
         logger.warning("GOOGLE_MAPS_API_KEY not set, skipping enrichment")
         return {"found": False, "error": "API key not configured"}
+
+    if not try_consume("google_places"):
+        return {"found": False, "error": "Daily Google Places cap reached"}
 
     query = f"{business_name} {city} {state}".strip()
 
@@ -67,8 +85,19 @@ async def enrich_business_google(
         if not candidates:
             return {"found": False, "query": query}
 
+        candidate = next(
+            (c for c in candidates if _names_match(business_name, c.get("name", ""))),
+            None,
+        )
+        if not candidate:
+            logger.info(
+                f"Places match rejected for '{business_name}': "
+                f"got '{candidates[0].get('name', '')}'"
+            )
+            return {"found": False, "query": query, "reason": "name_mismatch"}
+
         # Step 2: Get Place Details
-        place_id = candidates[0]["place_id"]
+        place_id = candidate["place_id"]
         try:
             details_resp = await client.get(
                 "https://maps.googleapis.com/maps/api/place/details/json",
@@ -87,7 +116,10 @@ async def enrich_business_google(
             logger.error(f"Google Places details failed: {e}")
             return {"found": False, "error": str(e)}
 
-    review_count = result.get("user_ratings_total", 0)
+    if result.get("business_status") == "CLOSED_PERMANENTLY":
+        return {"found": False, "query": query, "reason": "closed_permanently"}
+
+    review_count = result.get("user_ratings_total", 0) or 0
 
     enriched = {
         "found": True,

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from tools.parsing import as_number, parse_money
 
 logger = logging.getLogger(__name__)
 
@@ -170,11 +171,11 @@ def match_lead_to_funders(lead: dict) -> list[dict]:
         List of funder match dicts, sorted by priority (best first).
     """
     monthly_rev = _parse_revenue(lead.get("monthly_revenue", 0))
-    yib = lead.get("years_in_business", 0) or 0
-    credit_score = lead.get("credit_score", 0) or 0
+    yib = as_number(lead.get("years_in_business"))
+    credit_score = as_number(lead.get("credit_score"))
     industry = (lead.get("industry", "") or "").lower()
     state = (lead.get("state", "") or "").upper()
-    existing_positions = lead.get("existing_positions", 0) or 0
+    existing_positions = int(as_number(lead.get("existing_positions")))
 
     matches = []
 
@@ -338,19 +339,7 @@ def generate_offer_comparison(lead: dict) -> dict:
 
 def _parse_revenue(rev) -> float:
     """Parse revenue from various formats."""
-    if isinstance(rev, (int, float)):
-        return float(rev)
-    if isinstance(rev, str):
-        cleaned = rev.replace("$", "").replace(",", "").replace("/mo", "").strip()
-        if "-" in cleaned:
-            cleaned = cleaned.split("-")[0].strip()
-        cleaned = cleaned.upper().replace("K", "000").replace("M", "000000")
-        cleaned = cleaned.rstrip("+")
-        try:
-            return float(cleaned)
-        except ValueError:
-            return 0
-    return 0
+    return parse_money(rev)
 
 
 # ═══════════════════════════════════════════════════════════════

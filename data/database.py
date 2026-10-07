@@ -5,12 +5,17 @@ Handles UCC filings storage, lead scoring history,
 enrichment data, GHL export tracking, inbound discovery
 leads, GHL sync snapshots, and opportunity tracking.
 """
+import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from config import DB_PATH
+from tools.parsing import normalize_business_name, normalize_date
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -174,10 +179,65 @@ def init_db(db_path: Optional[Path] = None) -> None:
             errors TEXT,
             status TEXT DEFAULT 'running'
         );
+
+        -- Per-day API call counters so daily caps survive restarts
+        CREATE TABLE IF NOT EXISTS api_usage (
+            usage_date TEXT NOT NULL,
+            api TEXT NOT NULL,
+            calls INTEGER DEFAULT 0,
+            PRIMARY KEY (usage_date, api)
+        );
     """)
 
+    _migrate_columns(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_filings_debtor_norm "
+        "ON filings(debtor_name_normalized)"
+    )
     conn.commit()
     conn.close()
+
+
+# Columns added after the original schema. init_db() adds any that are
+# missing so existing databases upgrade in place.
+_ADDED_COLUMNS = {
+    "filings": {
+        "debtor_name_normalized": "TEXT",
+    },
+    "leads": {
+        "secured_party": "TEXT",
+        "funder_display_name": "TEXT",
+        "funder_tier": "INTEGER",
+        "urgency_level": "TEXT",
+        "position_count": "INTEGER",
+        "estimated_daily_payment": "REAL",
+        "estimated_monthly_obligation": "REAL",
+        "first_name": "TEXT",
+        "last_name": "TEXT",
+        "email_subject": "TEXT",
+        "email_body": "TEXT",
+        "sms_body": "TEXT",
+        "sales_notes": "TEXT",
+        "best_funder_match": "TEXT",
+    },
+}
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, col_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    # Backfill normalized debtor names for rows created before the column existed
+    rows = conn.execute(
+        "SELECT id, debtor_name FROM filings WHERE debtor_name_normalized IS NULL"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE filings SET debtor_name_normalized = ? WHERE id = ?",
+            (normalize_business_name(row["debtor_name"] or ""), row["id"]),
+        )
 
 
 def insert_filing(conn: sqlite3.Connection, filing: dict) -> Optional[int]:
@@ -185,14 +245,15 @@ def insert_filing(conn: sqlite3.Connection, filing: dict) -> Optional[int]:
     try:
         cursor = conn.execute("""
             INSERT OR IGNORE INTO filings
-            (filing_number, filing_date, debtor_name, debtor_address,
-             debtor_city, debtor_state, debtor_zip, secured_party,
-             secured_party_type, source_state, processed_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (filing_number, filing_date, debtor_name, debtor_name_normalized,
+             debtor_address, debtor_city, debtor_state, debtor_zip,
+             secured_party, secured_party_type, source_state, processed_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             filing.get("filing_number"),
-            filing.get("filing_date"),
+            normalize_date(filing.get("filing_date", "")) or filing.get("filing_date"),
             filing.get("debtor_name"),
+            normalize_business_name(filing.get("debtor_name", "")),
             filing.get("debtor_address"),
             filing.get("debtor_city"),
             filing.get("debtor_state"),
@@ -207,75 +268,108 @@ def insert_filing(conn: sqlite3.Connection, filing: dict) -> Optional[int]:
         return None
 
 
+_LEAD_COLUMNS = [
+    "filing_id", "source", "business_name", "phone", "email", "website",
+    "address", "city", "state", "zip_code", "industry", "monthly_revenue",
+    "years_in_business", "employee_count", "google_rating",
+    "google_review_count", "lead_score", "lead_tier", "score_reasons",
+    "business_focus", "personalized_message", "estimated_funding_amount",
+    "ucc_filing_age_months", "has_existing_mca", "domain", "description",
+    "linkedin", "contact_position", "email_confidence", "batch_date",
+    "secured_party", "funder_display_name", "funder_tier", "urgency_level",
+    "position_count", "estimated_daily_payment", "estimated_monthly_obligation",
+    "first_name", "last_name", "email_subject", "email_body", "sms_body",
+    "sales_notes", "best_funder_match",
+]
+
+
 def insert_lead(conn: sqlite3.Connection, lead: dict) -> Optional[int]:
     """Insert a scored lead record."""
+    values = []
+    for col in _LEAD_COLUMNS:
+        value = lead.get(col)
+        if col == "source" and not value:
+            value = "ucc"
+        if col == "urgency_level" and value is None:
+            value = (lead.get("urgency") or {}).get("level")
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value)
+        values.append(value)
+    placeholders = ", ".join("?" for _ in _LEAD_COLUMNS)
     try:
-        cursor = conn.execute("""
-            INSERT INTO leads
-            (filing_id, business_name, phone, email, website, address,
-             city, state, zip_code, industry, monthly_revenue,
-             years_in_business, employee_count, google_rating,
-             google_review_count, lead_score, lead_tier, score_reasons,
-             business_focus, personalized_message, estimated_funding_amount,
-             ucc_filing_age_months, has_existing_mca, batch_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            lead.get("filing_id"),
-            lead.get("business_name"),
-            lead.get("phone"),
-            lead.get("email"),
-            lead.get("website"),
-            lead.get("address"),
-            lead.get("city"),
-            lead.get("state"),
-            lead.get("zip_code"),
-            lead.get("industry"),
-            lead.get("monthly_revenue"),
-            lead.get("years_in_business"),
-            lead.get("employee_count"),
-            lead.get("google_rating"),
-            lead.get("google_review_count"),
-            lead.get("lead_score"),
-            lead.get("lead_tier"),
-            lead.get("score_reasons"),
-            lead.get("business_focus"),
-            lead.get("personalized_message"),
-            lead.get("estimated_funding_amount"),
-            lead.get("ucc_filing_age_months"),
-            lead.get("has_existing_mca"),
-            lead.get("batch_date"),
-        ))
+        cursor = conn.execute(
+            f"INSERT INTO leads ({', '.join(_LEAD_COLUMNS)}) VALUES ({placeholders})",
+            values,
+        )
         return cursor.lastrowid
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        logger.error(
+            f"insert_lead failed for {lead.get('business_name')}: {e}"
+        )
         return None
 
 
 def get_unprocessed_filings(
     conn: sqlite3.Connection,
     state: str,
-    days_back: int = 7,
+    min_age_months: float = 0,
+    max_age_months: float = 15,
     secured_party_type: Optional[str] = None,
     limit: int = 100,
 ) -> list[dict]:
-    """Get recent filings that haven't been converted to leads yet."""
-    cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    """
+    Get filings whose filing_date falls in [max_age_months ago, min_age_months ago]
+    and that haven't been converted to leads yet.
+
+    The window is on filing *age* because that's what predicts renewal
+    timing: a filing from ~6-12 months ago is a merchant whose advance is
+    maturing. Each filing becomes a lead once, so the window slides forward
+    day by day and picks up filings as they age into it.
+    """
+    now = datetime.now()
+    newest = (now - timedelta(days=int(min_age_months * 30))).strftime("%Y-%m-%d")
+    oldest = (now - timedelta(days=int(max_age_months * 30))).strftime("%Y-%m-%d")
     query = """
         SELECT f.* FROM filings f
         LEFT JOIN leads l ON l.filing_id = f.id
         WHERE f.debtor_state = ?
           AND f.filing_date >= ?
+          AND f.filing_date <= ?
           AND l.id IS NULL
     """
-    params: list = [state, cutoff]
+    params: list = [state, oldest, newest]
 
     if secured_party_type:
         query += " AND f.secured_party_type = ?"
         params.append(secured_party_type)
 
-    query += " ORDER BY f.filing_date DESC LIMIT ?"
+    # MCA filings first, then closest to the 8-10 month sweet spot
+    query += """
+        ORDER BY (f.secured_party_type = 'MCA_LENDER') DESC,
+                 ABS(julianday('now') - julianday(f.filing_date) - 270) ASC
+        LIMIT ?
+    """
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_debtor_filing_history(
+    conn: sqlite3.Connection,
+    debtor_name_normalized: str,
+    state: str,
+    since_months: float = 18,
+) -> list[dict]:
+    """All filings for a debtor (by normalized name) in a state within the lookback."""
+    if not debtor_name_normalized:
+        return []
+    cutoff = (datetime.now() - timedelta(days=int(since_months * 30))).strftime("%Y-%m-%d")
+    rows = conn.execute("""
+        SELECT * FROM filings
+        WHERE debtor_name_normalized = ? AND debtor_state = ? AND filing_date >= ?
+        ORDER BY filing_date DESC
+    """, (debtor_name_normalized, state, cutoff)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -427,7 +521,6 @@ def get_undiscovered_count(conn: sqlite3.Connection) -> int:
 
 def save_ghl_snapshot(conn: sqlite3.Connection, snapshot: dict) -> int:
     """Save a GHL inbound snapshot to the database."""
-    import json
     cursor = conn.execute("""
         INSERT INTO ghl_snapshots
         (snapshot_date, total_contacts, new_contacts_24h,
@@ -482,3 +575,26 @@ def sync_opportunities(conn: sqlite3.Connection, opportunities: list[dict]) -> i
         synced += 1
     conn.commit()
     return synced
+
+
+# ═══════════════════════════════════════════════════════════════
+# API USAGE / DAILY CAPS
+# ═══════════════════════════════════════════════════════════════
+
+def get_api_usage(conn: sqlite3.Connection, api: str, usage_date: Optional[str] = None) -> int:
+    """Calls recorded today (or on usage_date) for an API."""
+    usage_date = usage_date or datetime.now().strftime("%Y-%m-%d")
+    row = conn.execute(
+        "SELECT calls FROM api_usage WHERE usage_date = ? AND api = ?",
+        (usage_date, api),
+    ).fetchone()
+    return row["calls"] if row else 0
+
+
+def record_api_usage(conn: sqlite3.Connection, api: str, calls: int = 1) -> None:
+    """Increment today's call counter for an API."""
+    conn.execute("""
+        INSERT INTO api_usage (usage_date, api, calls) VALUES (?, ?, ?)
+        ON CONFLICT(usage_date, api) DO UPDATE SET calls = calls + excluded.calls
+    """, (datetime.now().strftime("%Y-%m-%d"), api, calls))
+    conn.commit()

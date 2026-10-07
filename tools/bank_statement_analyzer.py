@@ -25,6 +25,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from tools.parsing import as_number
 
 logger = logging.getLogger(__name__)
 
@@ -189,16 +190,17 @@ def analyze_bank_statement(
 
 def _compute_underwriting_summary(metrics: dict) -> dict:
     """Compute a quick underwriting summary from extracted metrics."""
-    total_deposits = metrics.get("total_deposits", 0)
-    nsf_count = metrics.get("nsf_overdraft_count", 0)
-    neg_days = metrics.get("negative_balance_days", 0)
-    mca_payments = metrics.get("detected_mca_payments", [])
-    avg_balance = metrics.get("average_daily_balance", 0)
+    # The model returns null for fields it can't read; treat those as 0
+    total_deposits = as_number(metrics.get("total_deposits"))
+    nsf_count = int(as_number(metrics.get("nsf_overdraft_count")))
+    neg_days = int(as_number(metrics.get("negative_balance_days")))
+    mca_payments = metrics.get("detected_mca_payments") or []
+    avg_balance = as_number(metrics.get("average_daily_balance"))
 
     # Stacking risk
     num_positions = len(mca_payments)
     total_daily_mca_obligation = sum(
-        p.get("estimated_monthly_total", 0) / 22  # ~22 business days
+        as_number(p.get("estimated_monthly_total")) / 22  # ~22 business days
         for p in mca_payments
     )
 
@@ -217,7 +219,7 @@ def _compute_underwriting_summary(metrics: dict) -> dict:
     health = max(health, 0)
 
     # Sustainable daily payment capacity (rough estimate)
-    daily_deposits = metrics.get("daily_average_deposits", total_deposits / 22)
+    daily_deposits = as_number(metrics.get("daily_average_deposits"), total_deposits / 22)
     sustainable_daily = max(0, (daily_deposits * 0.15) - total_daily_mca_obligation)
 
     return {

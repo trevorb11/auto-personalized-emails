@@ -20,23 +20,18 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Callable, Optional
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import HIGH_VALUE_INDUSTRIES
+from config import (
+    GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID, HUNTER_API_KEY, CLEARBIT_API_KEY,
+)
+from tools.api_budget import try_consume
+from tools.parsing import is_directory_domain, normalize_domain
 
 logger = logging.getLogger(__name__)
-
-# API keys loaded from environment at import time
-import os
-
-GOOGLE_CSE_API_KEY = os.environ.get("GOOGLE_CSE_API_KEY", "")
-GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
-HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
-CLEARBIT_API_KEY = os.environ.get("CLEARBIT_API_KEY", "")
 
 _TIMEOUT = 15.0
 
@@ -102,6 +97,8 @@ async def search_google_cse(
     if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_ID:
         logger.warning("Google CSE not configured (GOOGLE_CSE_API_KEY / GOOGLE_CSE_ID)")
         return []
+    if not try_consume("google_cse"):
+        return []
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
@@ -120,7 +117,7 @@ async def search_google_cse(
             results = []
             for item in items:
                 link = item.get("link", "")
-                domain = urlparse(link).netloc if link else ""
+                domain = normalize_domain(link)
                 results.append({
                     "title": item.get("title", ""),
                     "link": link,
@@ -187,8 +184,11 @@ async def discover_businesses(
 
         for r in results:
             domain = r.get("domain", "")
+            # Directory/social listings aren't the business's own site
+            if not domain or is_directory_domain(domain):
+                continue
             # Deduplicate by domain
-            if domain and domain not in seen_domains:
+            if domain not in seen_domains:
                 seen_domains.add(domain)
                 all_results.append(r)
 
@@ -214,6 +214,8 @@ async def find_emails_hunter(domain: str) -> dict:
     """
     if not HUNTER_API_KEY:
         logger.warning("HUNTER_API_KEY not configured")
+        return {"emails": [], "organization": "", "pattern": ""}
+    if not try_consume("hunter"):
         return {"emails": [], "organization": "", "pattern": ""}
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -258,7 +260,7 @@ async def verify_email_hunter(email: str) -> dict:
     Returns dict with: result (deliverable/undeliverable/risky),
     score (0-100), and details.
     """
-    if not HUNTER_API_KEY:
+    if not HUNTER_API_KEY or not try_consume("hunter"):
         return {"result": "unknown", "score": 0}
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -296,6 +298,8 @@ async def enrich_company_clearbit(domain: str) -> dict:
     """
     if not CLEARBIT_API_KEY:
         logger.warning("CLEARBIT_API_KEY not configured")
+        return {"found": False}
+    if not try_consume("clearbit"):
         return {"found": False}
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -359,12 +363,16 @@ async def discover_and_enrich(
     state: str,
     max_leads: int = 10,
     enrich: bool = True,
+    skip_domain: Optional[Callable[[str], bool]] = None,
 ) -> list[dict]:
     """
     Full inbound lead discovery pipeline:
       1. Google CSE → find businesses by industry + location
       2. Hunter.io → find decision-maker emails for each domain
       3. Clearbit → enrich with revenue, employee count, industry data
+
+    skip_domain: optional predicate (e.g. "already in our DB") checked
+    BEFORE any paid enrichment call, so known domains cost nothing.
 
     Returns a list of enriched lead dicts ready for scoring and GHL.
     """
@@ -378,6 +386,9 @@ async def discover_and_enrich(
     for result in search_results:
         domain = result.get("domain", "")
         if not domain:
+            continue
+        if skip_domain and skip_domain(domain):
+            logger.info(f"  Skipping known domain before enrichment: {domain}")
             continue
 
         lead = {
@@ -499,10 +510,16 @@ def _annual_to_monthly_str(annual_str: str) -> str:
 def get_mca_search_targets(
     states: list[str],
     cities_per_state: int = 3,
+    rotation_seed: Optional[int] = None,
+    per_day: int = 1,
 ) -> list[dict]:
     """
     Generate a list of industry + location targets for MCA prospecting.
-    These are the search combinations the agent will run daily.
+
+    The list is interleaved across states/cities/industries and rotated by
+    rotation_seed (defaults to today's date ordinal) × per_day, so taking the
+    first per_day targets each day walks through the whole space instead of re-running
+    the same few searches (which return the same, already-known domains).
     """
     # Top MCA cities by deal volume
     state_cities = {
@@ -523,18 +540,19 @@ def get_mca_search_targets(
         "landscaping", "plumbing", "hvac", "roofing",
     ]
 
-    targets = []
-    for state in states:
-        cities = state_cities.get(state, [f"{state} businesses"])[:cities_per_state]
-        for city in cities:
-            for industry in top_industries[:6]:  # Top 6 per city for broader reach
-                targets.append({
-                    "industry": industry,
-                    "city": city,
-                    "state": state,
-                })
+    combos = []
+    for industry in top_industries:
+        for state in states:
+            # Unknown states fall back to a statewide search
+            for city in state_cities.get(state, [state])[:cities_per_state]:
+                combos.append({"industry": industry, "city": city, "state": state})
 
-    return targets
+    if not combos:
+        return []
+    if rotation_seed is None:
+        rotation_seed = datetime.now().toordinal()
+    offset = (rotation_seed * per_day) % len(combos)
+    return combos[offset:] + combos[:offset]
 
 
 # ── Standalone test ────────────────────────────────────────────

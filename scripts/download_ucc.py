@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DB_PATH, MCA_LENDERS, DATA_DIR, UCC_DATA_DIR
 from data.database import init_db, get_connection, insert_filing
+from tools.parsing import match_lender, normalize_date
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 def classify_secured_party(name: str) -> str:
     """Classify a secured party as MCA lender, bank, equipment, or other."""
     name_lower = name.lower()
-    if any(lender in name_lower for lender in MCA_LENDERS):
+    if match_lender(name, MCA_LENDERS):
         return "MCA_LENDER"
     elif any(term in name_lower for term in ["bank", "credit union", "federal savings"]):
         return "BANK"
@@ -139,6 +140,13 @@ def process_filings(filings: list[dict]) -> tuple[int, int]:
     skipped = 0
 
     for filing in filings:
+        # Dates must be ISO for the renewal-window queries to work
+        iso_date = normalize_date(filing.get("filing_date", ""))
+        if not iso_date:
+            skipped += 1
+            continue
+        filing["filing_date"] = iso_date
+
         # Classify the secured party
         secured = filing.get("secured_party", "")
         filing["secured_party_type"] = classify_secured_party(secured) if secured else "OTHER"

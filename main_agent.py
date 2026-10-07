@@ -25,24 +25,28 @@ from pathlib import Path
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
+import config
 from config import (
-    TARGET_STATES, DRY_RUN, DAILY_GHL_CREATES,
-    DAILY_GOOGLE_LOOKUPS, DAILY_CSE_SEARCHES,
-    DAILY_HUNTER_LOOKUPS, DAILY_CLEARBIT_LOOKUPS,
-    LOGS_DIR, GHL_API_KEY,
+    TARGET_STATES, LOGS_DIR, GHL_API_KEY, UCC_FILINGS_PER_STATE,
 )
 from data.database import (
     init_db, get_connection, insert_lead,
-    get_leads_by_tier, mark_lead_exported,
+    mark_lead_exported,
     start_daily_run, complete_daily_run,
     is_domain_known, record_domain,
     save_ghl_snapshot, sync_opportunities,
 )
+from tools import api_budget
 from tools.ucc_processor import process_ucc_filings
 from tools.lead_scorer import score_mca_lead
 from tools.google_maps_enricher import enrich_business_google
 from tools.email_generator import generate_outreach_email
-from tools.ghl_client import create_contact, pull_inbound_snapshot
+from tools.funder_matrix import get_best_offer
+from tools.conversation_analyzer import score_conversation_urgency
+from tools.ghl_client import (
+    create_contact, add_contact_note, pull_inbound_snapshot,
+    get_conversation_messages,
+)
 from tools.inbound_leads import discover_and_enrich, get_mca_search_targets
 from tools.slack_notifier import send_morning_summary, send_alert
 
@@ -97,39 +101,121 @@ async def sync_ghl_inbound() -> dict:
     )
 
     snapshot["_snapshot_id"] = snapshot_id
+    snapshot["hot_conversations"] = await find_hot_conversations(
+        snapshot.get("recent_conversations", [])
+    )
     return snapshot
+
+
+async def find_hot_conversations(
+    conversations: list[dict],
+    min_urgency: int = 6,
+    max_checked: int = 30,
+) -> list[dict]:
+    """
+    Score recent GHL conversations with the free keyword scorer and return
+    the ones where a merchant is showing buying intent, so reps see them
+    in the morning report before any new outbound.
+    """
+    hot = []
+    for conv in conversations[:max_checked]:
+        # Only conversations where the merchant spoke last need a reply
+        if conv.get("lastMessageDirection") == "outbound":
+            continue
+        messages = await get_conversation_messages(conv.get("id", ""), limit=20)
+        if not messages:
+            continue
+        urgency = score_conversation_urgency(messages)
+        if urgency >= min_urgency:
+            hot.append({
+                "conversation_id": conv.get("id"),
+                "contact_id": conv.get("contactId"),
+                "contact_name": conv.get("contactName") or conv.get("fullName") or "",
+                "urgency": urgency,
+                "last_message": (conv.get("lastMessageBody") or "")[:140],
+            })
+    hot.sort(key=lambda c: c["urgency"], reverse=True)
+    if hot:
+        logger.info(f"  {len(hot)} hot conversations need a reply")
+    return hot
 
 
 # ═══════════════════════════════════════════════════════════════
 # PHASE 1: UCC FILING PROCESSING
 # ═══════════════════════════════════════════════════════════════
 
-async def process_state_filings(
-    state: str,
-    batch_date: str,
-    google_lookups_remaining: int,
-) -> tuple[list[dict], int]:
+# Fields from the UCC processor that scoring, outreach and GHL need.
+_UCC_INTEL_FIELDS = [
+    "secured_party", "filing_date", "funder_display_name", "funder_tier",
+    "funder_weakness", "funder_positioning", "funder_sweet_spot", "urgency",
+    "estimated_advance", "estimated_factor_rate", "estimated_daily_payment",
+    "estimated_monthly_obligation", "estimated_remaining_balance",
+    "estimated_months_remaining", "estimated_payoff_date",
+    "position_count", "other_funders", "is_stacked",
+]
+
+
+def finalize_lead(lead: dict) -> dict:
+    """
+    Score a lead, attach the best-fit funder, and draft outreach for
+    A/B tiers. Mutates and returns the lead.
+    """
+    score_result = score_mca_lead(lead)
+    lead.update({
+        "lead_score": score_result["score"],
+        "lead_tier": score_result["tier"],
+        "score_reasons": json.dumps(score_result["reasons"]),
+        "business_focus": score_result["business_focus"],
+        "estimated_funding_amount": score_result["estimated_funding_amount"],
+    })
+
+    if score_result["tier"] not in ("A", "B"):
+        return lead
+
+    best = get_best_offer({
+        **lead,
+        "existing_positions": lead.get("position_count") or (1 if lead.get("has_existing_mca") else 0),
+    })
+    if best:
+        lead["best_funder_match"] = (
+            f"{best['funder']} (~${best['estimated_amount']:,.0f} @ "
+            f"{best['estimated_factor_rate']:.2f})"
+        )
+
+    # Claude rewrites are reserved for A-tier to keep spend focused
+    email = generate_outreach_email(lead, use_llm=score_result["tier"] == "A")
+    lead.update({
+        "email_subject": email["subject"],
+        "email_body": email["body"],
+        "sms_body": email["sms_variant"],
+        "sales_notes": "\n".join(email["personalization_notes"]),
+        "personalized_message": (
+            f"Subject: {email['subject']}\n\n{email['body']}"
+            f"\n\n---\nSMS: {email['sms_variant']}"
+        ),
+    })
+    return lead
+
+
+async def process_state_filings(state: str, batch_date: str) -> list[dict]:
     """
     Process UCC filings for a single state:
-      - Pull unprocessed filings
-      - Enrich via Google Maps (if API key configured)
-      - Score each lead
-      - Generate outreach for A/B-tier leads
+      - Pull filings that have aged into the renewal window
+      - Enrich via Google Maps (daily cap enforced in the enricher)
+      - Score, match funders, and draft outreach for A/B-tier leads
     """
     logger.info(f"Processing UCC filings: {state}")
     leads = []
     lookups_used = 0
 
-    result = process_ucc_filings(state=state, days_back=7)
+    result = process_ucc_filings(state=state, limit=UCC_FILINGS_PER_STATE)
     filings = result.get("filings", [])
     logger.info(
         f"  {state}: {result['total_filings']} filings, "
         f"{result['mca_filings']} MCA, "
-        f"{result['in_renewal_window']} in renewal window"
+        f"{result['in_renewal_window']} in renewal window, "
+        f"{result['stacked_merchants']} stacked"
     )
-
-    if not filings:
-        return leads, lookups_used
 
     for filing in filings:
         lead_data = {
@@ -143,49 +229,34 @@ async def process_state_filings(
             "has_existing_mca": filing.get("is_mca_lender", False),
             "ucc_filing_age_months": filing.get("filing_age_months"),
             "batch_date": batch_date,
+            **{k: filing.get(k) for k in _UCC_INTEL_FIELDS if k in filing},
         }
 
-        # Enrich via Google Maps (rate-limited)
-        if lookups_used < google_lookups_remaining:
-            try:
-                enrichment = await enrich_business_google(
-                    business_name=filing.get("business_name", ""),
-                    city=filing.get("city", ""),
-                    state=filing.get("state", ""),
-                )
-                if enrichment.get("found"):
-                    lead_data.update({
-                        "phone": enrichment.get("phone"),
-                        "website": enrichment.get("website"),
-                        "google_rating": enrichment.get("rating"),
-                        "google_review_count": enrichment.get("review_count", 0),
-                        "monthly_revenue": enrichment.get("estimated_monthly_revenue", ""),
-                        "industry": _infer_industry(enrichment.get("categories", [])),
-                    })
-                    lookups_used += 1
-            except Exception as e:
-                logger.warning(f"  Enrichment failed for {filing.get('business_name')}: {e}")
-
-        # Score
-        score_result = score_mca_lead(lead_data)
-        lead_data.update({
-            "lead_score": score_result["score"],
-            "lead_tier": score_result["tier"],
-            "score_reasons": json.dumps(score_result["reasons"]),
-            "business_focus": score_result["business_focus"],
-            "estimated_funding_amount": score_result["estimated_funding_amount"],
-        })
-
-        # Generate outreach for A/B-tier
-        if score_result["tier"] in ("A", "B"):
-            lead_data["secured_party"] = filing.get("secured_party", "")
-            email = generate_outreach_email(lead_data)
-            lead_data["personalized_message"] = (
-                f"Subject: {email['subject']}\n\n{email['body']}"
-                f"\n\n---\nSMS: {email['sms_variant']}"
+        try:
+            enrichment = await enrich_business_google(
+                business_name=filing.get("business_name") or "",
+                city=filing.get("city") or "",
+                state=filing.get("state") or "",
             )
+            if enrichment.get("found"):
+                lookups_used += 1
+                lead_data.update({
+                    "phone": enrichment.get("phone"),
+                    "website": enrichment.get("website"),
+                    "google_rating": enrichment.get("rating"),
+                    "google_review_count": enrichment.get("review_count", 0),
+                    "monthly_revenue": enrichment.get("estimated_monthly_revenue", ""),
+                    "revenue_is_estimate": True,
+                    "industry": _infer_industry(enrichment.get("categories", [])),
+                })
+            elif enrichment.get("reason") == "closed_permanently":
+                logger.info(f"  Skipping closed business: {filing.get('business_name')}")
+                continue
+        except Exception as e:
+            logger.warning(f"  Enrichment failed for {filing.get('business_name')}: {e}")
 
-        # Save to DB
+        finalize_lead(lead_data)
+
         conn = get_connection()
         lead_id = insert_lead(conn, lead_data)
         conn.commit()
@@ -195,8 +266,8 @@ async def process_state_filings(
             lead_data["id"] = lead_id
             leads.append(lead_data)
 
-    logger.info(f"  {state}: {len(leads)} leads scored, {lookups_used} Google lookups")
-    return leads, lookups_used
+    logger.info(f"  {state}: {len(leads)} leads scored, {lookups_used} Google matches")
+    return leads
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -210,17 +281,18 @@ async def run_inbound_discovery(
 ) -> list[dict]:
     """
     Discover new leads via Google CSE + Hunter.io + Clearbit.
-    Skips domains we've already seen. Scores and generates outreach.
+    Known domains are skipped before any paid enrichment. Search targets
+    rotate daily so each run covers new industry/city combinations.
     """
     logger.info("=== Phase 2: Inbound Lead Discovery ===")
     all_inbound_leads = []
 
-    # Get search targets (industry + city combos)
-    targets = get_mca_search_targets(states, cities_per_state=2)
-
-    # Limit to control API spend
+    targets = get_mca_search_targets(states, cities_per_state=2, per_day=max_targets)
     targets = targets[:max_targets]
-    logger.info(f"  Running {len(targets)} discovery searches")
+    logger.info(
+        f"  Running {len(targets)} discovery searches: "
+        + ", ".join(f"{t['industry']}/{t['city']}" for t in targets)
+    )
 
     conn = get_connection()
 
@@ -232,39 +304,16 @@ async def run_inbound_discovery(
                 state=target["state"],
                 max_leads=5,
                 enrich=True,
+                skip_domain=lambda d: is_domain_known(conn, d),
             )
 
             for lead in raw_leads:
                 domain = lead.get("domain", "")
-
-                # Skip already-known domains
-                if domain and is_domain_known(conn, domain):
-                    logger.info(f"  Skipping known domain: {domain}")
-                    continue
-
-                # Add source and batch info
                 lead["source"] = "inbound-discovery"
                 lead["batch_date"] = batch_date
 
-                # Score
-                score_result = score_mca_lead(lead)
-                lead.update({
-                    "lead_score": score_result["score"],
-                    "lead_tier": score_result["tier"],
-                    "score_reasons": json.dumps(score_result["reasons"]),
-                    "business_focus": score_result["business_focus"],
-                    "estimated_funding_amount": score_result["estimated_funding_amount"],
-                })
+                finalize_lead(lead)
 
-                # Generate outreach for A/B-tier
-                if score_result["tier"] in ("A", "B"):
-                    email = generate_outreach_email(lead)
-                    lead["personalized_message"] = (
-                        f"Subject: {email['subject']}\n\n{email['body']}"
-                        f"\n\n---\nSMS: {email['sms_variant']}"
-                    )
-
-                # Save lead to DB
                 lead_id = insert_lead(conn, lead)
                 conn.commit()
 
@@ -272,7 +321,6 @@ async def run_inbound_discovery(
                     lead["id"] = lead_id
                     all_inbound_leads.append(lead)
 
-                # Record the domain so we don't re-discover it
                 if domain:
                     record_domain(
                         conn, domain,
@@ -296,12 +344,18 @@ async def run_inbound_discovery(
 # PHASE 4: GHL EXPORT
 # ═══════════════════════════════════════════════════════════════
 
-async def export_to_ghl(leads: list[dict], max_creates: int) -> int:
-    """Export qualified leads to GoHighLevel."""
+async def export_to_ghl(leads: list[dict]) -> int:
+    """Export A-tier leads to GoHighLevel, best first, within the daily cap."""
     created = 0
-    a_tier = [l for l in leads if l.get("lead_tier") == "A"]
+    a_tier = sorted(
+        (l for l in leads if l.get("lead_tier") == "A"),
+        key=lambda l: l.get("lead_score", 0),
+        reverse=True,
+    )
 
-    for lead in a_tier[:max_creates]:
+    for lead in a_tier:
+        if not config.DRY_RUN and not api_budget.try_consume("ghl_create"):
+            break
         try:
             result = await create_contact(lead)
 
@@ -312,6 +366,10 @@ async def export_to_ghl(leads: list[dict], max_creates: int) -> int:
                     mark_lead_exported(conn, lead["id"], contact_id)
                     conn.commit()
                     conn.close()
+                    if lead.get("sales_notes"):
+                        await add_contact_note(
+                            contact_id, f"AI prospecting notes:\n{lead['sales_notes']}"
+                        )
                 created += 1
 
             elif result.get("duplicate"):
@@ -372,18 +430,18 @@ async def run_daily_prospecting(
     dry_run: bool | None = None,
     skip_inbound: bool = False,
     skip_ghl_sync: bool = False,
+    max_targets: int = 4,
 ) -> None:
     """Main daily prospecting workflow."""
     if states is None:
         states = TARGET_STATES
     if dry_run is not None:
-        import config
         config.DRY_RUN = dry_run
 
     batch_date = datetime.now().strftime("%Y-%m-%d")
     logger.info(f"{'='*60}")
     logger.info(f"MCA Prospecting Agent - {batch_date}")
-    logger.info(f"States: {states} | Dry run: {DRY_RUN}")
+    logger.info(f"States: {states} | Dry run: {config.DRY_RUN}")
     logger.info(f"{'='*60}")
 
     init_db()
@@ -394,7 +452,6 @@ async def run_daily_prospecting(
 
     all_leads = []
     inbound_leads = []
-    total_google_lookups = 0
     ghl_snapshot = {}
     errors = []
 
@@ -412,14 +469,8 @@ async def run_daily_prospecting(
         logger.info("\n=== Phase 1: UCC Filing Processing ===")
         for state in states:
             try:
-                remaining_lookups = DAILY_GOOGLE_LOOKUPS - total_google_lookups
-                leads, lookups = await process_state_filings(
-                    state=state,
-                    batch_date=batch_date,
-                    google_lookups_remaining=remaining_lookups,
-                )
+                leads = await process_state_filings(state=state, batch_date=batch_date)
                 all_leads.extend(leads)
-                total_google_lookups += lookups
             except Exception as e:
                 error_msg = f"State {state} UCC processing failed: {e}"
                 logger.error(error_msg)
@@ -431,7 +482,7 @@ async def run_daily_prospecting(
                 inbound_leads = await run_inbound_discovery(
                     states=states,
                     batch_date=batch_date,
-                    max_targets=4,
+                    max_targets=max_targets,
                 )
                 all_leads.extend(inbound_leads)
             except Exception as e:
@@ -455,7 +506,7 @@ async def run_daily_prospecting(
         # ── Phase 4: Export to GHL ────────────────────────────
         contacts_created = 0
         if tier_a:
-            contacts_created = await export_to_ghl(all_leads, DAILY_GHL_CREATES)
+            contacts_created = await export_to_ghl(all_leads)
             logger.info(f"GHL contacts created: {contacts_created}")
 
         # ── Phase 5: Slack Summary ────────────────────────────
@@ -470,7 +521,7 @@ async def run_daily_prospecting(
                 if all_leads else 0
             ),
             "contacts_created": contacts_created,
-            "dry_run": DRY_RUN,
+            "dry_run": config.DRY_RUN,
             "ucc_leads": ucc_count,
             "inbound_leads": inbound_count,
             "ghl_open_opps": len(ghl_snapshot.get("open_opportunities", [])),
@@ -482,7 +533,10 @@ async def run_daily_prospecting(
             tier_a, key=lambda l: l.get("lead_score", 0), reverse=True
         )[:5]
 
-        await send_morning_summary(stats, top_leads)
+        await send_morning_summary(
+            stats, top_leads,
+            hot_conversations=ghl_snapshot.get("hot_conversations", []),
+        )
 
         # ── Record run completion ─────────────────────────────
         conn = get_connection()
@@ -545,15 +599,15 @@ def main():
         help="Skip GHL inbound snapshot",
     )
     parser.add_argument(
-        "--days-back",
+        "--max-targets",
         type=int,
-        default=7,
-        help="How many days of filings to look back (default: 7)",
+        default=4,
+        help="Inbound discovery searches per run (default: 4)",
     )
 
     args = parser.parse_args()
 
-    states = args.states.split(",") if args.states else None
+    states = [st.strip().upper() for st in args.states.split(",")] if args.states else None
     dry_run = None
     if args.dry_run:
         dry_run = True
@@ -565,6 +619,7 @@ def main():
         dry_run=dry_run,
         skip_inbound=args.skip_inbound,
         skip_ghl_sync=args.skip_ghl_sync,
+        max_targets=args.max_targets,
     ))
 
 

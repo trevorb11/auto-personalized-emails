@@ -41,7 +41,11 @@ async def send_slack_message(text: str) -> bool:
             return False
 
 
-async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
+async def send_morning_summary(
+    stats: dict,
+    top_leads: list[dict],
+    hot_conversations: list[dict] | None = None,
+) -> bool:
     """
     Send the formatted morning summary to the sales team.
 
@@ -50,6 +54,8 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
                avg_score, contacts_created, etc.
         top_leads: list of top A-tier lead dicts with business_name,
                    lead_score, industry, business_focus.
+        hot_conversations: GHL conversations where a merchant showed
+                   buying intent and is waiting on a reply.
     """
     date_str = datetime.now().strftime("%A, %B %d, %Y")
 
@@ -95,6 +101,17 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
     elif stats.get("dry_run"):
         lines.append("*Mode:* Dry run (no GHL writes)")
 
+    # Replies first — warm merchants beat cold prospects
+    if hot_conversations:
+        lines.append(f"\n*Reply First — {len(hot_conversations)} hot conversation(s):*")
+        for conv in hot_conversations[:5]:
+            name = conv.get("contact_name") or conv.get("contact_id") or "Unknown"
+            snippet = conv.get("last_message", "")
+            lines.append(
+                f"  • {name} (urgency {conv.get('urgency')}/10)"
+                + (f": _{snippet}_" if snippet else "")
+            )
+
     # Top leads
     if top_leads:
         lines.append("\n*Top Prospects:*")
@@ -109,6 +126,16 @@ async def send_morning_summary(stats: dict, top_leads: list[dict]) -> bool:
                 f"  {i}. {name} (Score: {score}) "
                 f"- {industry} - {focus}{source_tag}"
             )
+            details = [
+                d for d in (
+                    lead.get("funder_display_name") and f"funder: {lead['funder_display_name']}",
+                    (lead.get("urgency") or {}).get("label"),
+                    lead.get("phone"),
+                    lead.get("best_funder_match") and f"fit: {lead['best_funder_match']}",
+                ) if d
+            ]
+            if details:
+                lines.append(f"      {' | '.join(details)}")
 
     # Errors
     errors = stats.get("errors")

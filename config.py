@@ -5,6 +5,12 @@ All secrets loaded from environment variables.
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:  # python-dotenv is optional; plain env vars still work
+    pass
+
 # ── Project paths ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -48,11 +54,36 @@ APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 # ── Agent settings ─────────────────────────────────────────────
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 
-# Dry run mode: logs actions without writing to GHL
+# Dry run mode: logs actions without writing to GHL.
+# Read it as `config.DRY_RUN` at call time (not `from config import DRY_RUN`)
+# so the --dry-run / --no-dry-run CLI overrides take effect everywhere.
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+# ── Outreach identity & compliance ────────────────────────────
+# CAN-SPAM requires a valid physical postal address and an opt-out in
+# every commercial email; TCPA practice requires STOP language in SMS.
+SENDER_NAME = os.environ.get("SENDER_NAME", "")
+SENDER_COMPANY = os.environ.get("SENDER_COMPANY", "Today Capital Group")
+SENDER_ADDRESS = os.environ.get("SENDER_ADDRESS", "")
+SENDER_PHONE = os.environ.get("SENDER_PHONE", "")
+OPT_OUT_TEXT = os.environ.get(
+    "OPT_OUT_TEXT",
+    "Not interested? Reply \"unsubscribe\" and we won't contact you again.",
+)
+
+# Optional Claude rewrite of template emails into a more natural,
+# lead-specific draft. Templates are always the fallback.
+EMAIL_LLM_PERSONALIZE = os.environ.get("EMAIL_LLM_PERSONALIZE", "false").lower() == "true"
+
+# ── UCC renewal window ────────────────────────────────────────
+# Filings this many months old are scanned each run. Filing *age* drives
+# renewal timing, so this is a window on filing_date, not on ingest date.
+UCC_MIN_AGE_MONTHS = float(os.environ.get("UCC_MIN_AGE_MONTHS", "5"))
+UCC_MAX_AGE_MONTHS = float(os.environ.get("UCC_MAX_AGE_MONTHS", "15"))
+UCC_FILINGS_PER_STATE = int(os.environ.get("UCC_FILINGS_PER_STATE", "250"))
 
 # ── Daily caps (safety limits) ─────────────────────────────────
 DAILY_GHL_CREATES = int(os.environ.get("DAILY_GHL_CREATES", "100"))
@@ -273,7 +304,7 @@ GOOGLE_ADS_MCP_CONFIG = {
 # Setup: https://github.com/apify/actors-mcp-server
 APIFY_MCP_CONFIG = {
     "command": "npx",
-    "args": ["-y", "@anthropic-ai/apify-mcp-server"],
+    "args": ["-y", "@apify/actors-mcp-server"],
     "env": {
         "APIFY_TOKEN": APIFY_API_TOKEN,
     },
@@ -283,7 +314,7 @@ APIFY_MCP_CONFIG = {
 # Setup: https://github.com/microsoft/playwright-mcp
 PLAYWRIGHT_MCP_CONFIG = {
     "command": "npx",
-    "args": ["@anthropic-ai/playwright-mcp-server"],
+    "args": ["-y", "@playwright/mcp@latest"],
 }
 
 # All MCP configs in one dict for easy iteration

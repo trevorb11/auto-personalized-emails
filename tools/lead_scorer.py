@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import HIGH_VALUE_INDUSTRIES
+from tools.parsing import as_number, parse_money
 
 
 def score_mca_lead(args: dict) -> dict:
@@ -31,10 +32,8 @@ def score_mca_lead(args: dict) -> dict:
     reasons = []
 
     # ── Revenue scoring (biggest weight: up to 25 pts) ─────────
-    rev = args.get("monthly_revenue", 0)
-    if isinstance(rev, str):
-        # Handle strings like "$50K-$100K/mo" or "50000"
-        rev = _parse_revenue(rev)
+    # Handles numbers and strings like "$50K-$100K/mo", "$100K+/mo", "1.5M"
+    rev = parse_money(args.get("monthly_revenue"))
     if rev >= 50000:
         score += 25
         reasons.append(f"Strong revenue: ${rev:,.0f}/mo")
@@ -48,7 +47,7 @@ def score_mca_lead(args: dict) -> dict:
         reasons.append(f"Below minimum revenue: ${rev:,.0f}/mo")
 
     # ── Industry scoring (up to 15 pts) ────────────────────────
-    industry = args.get("industry", "").lower()
+    industry = (args.get("industry") or "").lower()
     if any(ind in industry for ind in HIGH_VALUE_INDUSTRIES):
         score += 15
         reasons.append(f"High-value industry: {industry}")
@@ -56,7 +55,7 @@ def score_mca_lead(args: dict) -> dict:
         score += 5
 
     # ── Time in business (up to 15 pts) ────────────────────────
-    yib = args.get("years_in_business", 0) or 0
+    yib = as_number(args.get("years_in_business"))
     if yib >= 2:
         score += 15
         reasons.append(f"{yib} years in business")
@@ -68,9 +67,9 @@ def score_mca_lead(args: dict) -> dict:
         reasons.append("Less than 1 year - limited options")
 
     # ── UCC / MCA renewal opportunity (up to 20 pts) ──────────
-    ucc_age = args.get("ucc_filing_age_months", 0) or 0
-    has_existing_mca = args.get("has_existing_mca", False)
-    urgency_level = args.get("urgency", {}).get("level", "")
+    ucc_age = as_number(args.get("ucc_filing_age_months"))
+    has_existing_mca = bool(args.get("has_existing_mca"))
+    urgency_level = (args.get("urgency") or {}).get("level", "")
 
     if urgency_level == "critical":
         score += 20
@@ -86,8 +85,8 @@ def score_mca_lead(args: dict) -> dict:
         reasons.append("Has existing MCA - consolidation opportunity")
 
     # ── Stacking distress (up to 15 pts) ─────────────────────
-    position_count = args.get("position_count", 1) or 1
-    est_monthly_obligation = args.get("estimated_monthly_obligation", 0) or 0
+    position_count = int(as_number(args.get("position_count"), 1) or 1)
+    est_monthly_obligation = as_number(args.get("estimated_monthly_obligation"))
 
     if position_count >= 3:
         score += 15
@@ -107,7 +106,7 @@ def score_mca_lead(args: dict) -> dict:
             reasons.append(f"MCA obligation ~{strain_pct:.0f}% of revenue")
 
     # ── Funder switching / shopping signals (up to 8 pts) ─────
-    other_funders = args.get("other_funders", [])
+    other_funders = args.get("other_funders") or []
     if other_funders and has_existing_mca:
         funder_names = set(
             f.get("funder", "").lower() for f in other_funders
@@ -137,7 +136,7 @@ def score_mca_lead(args: dict) -> dict:
             reasons.append(f"Growth signals: {', '.join(found_signals)}")
 
     # ── Google reviews as activity proxy (up to 10 pts) ────────
-    reviews = args.get("google_review_count", 0) or 0
+    reviews = int(as_number(args.get("google_review_count")))
     if reviews >= 100:
         score += 10
         reasons.append(f"{reviews} reviews suggests established business")
@@ -148,7 +147,7 @@ def score_mca_lead(args: dict) -> dict:
         score += 3
 
     # ── Employee count as revenue proxy (up to 5 pts) ──────────
-    employees = args.get("employee_count", 0) or 0
+    employees = int(as_number(args.get("employee_count")))
     if employees >= 10:
         score += 5
         reasons.append(f"{employees} employees")
@@ -156,7 +155,7 @@ def score_mca_lead(args: dict) -> dict:
         score += 3
 
     # ── Google rating bonus (up to 5 pts) ──────────────────────
-    rating = args.get("google_rating", 0) or 0
+    rating = as_number(args.get("google_rating"))
     if rating >= 4.5 and reviews >= 20:
         score += 5
         reasons.append(f"{rating} star rating - well-regarded business")
@@ -202,19 +201,6 @@ def score_mca_lead(args: dict) -> dict:
         "business_focus": business_focus,
         "estimated_funding_amount": _estimate_funding_amount(rev),
     }
-
-
-def _parse_revenue(rev_str: str) -> float:
-    """Parse revenue strings like '$50K-$100K/mo' into a numeric value."""
-    cleaned = rev_str.replace("$", "").replace(",", "").replace("/mo", "").strip()
-    # Take the first number in a range
-    if "-" in cleaned:
-        cleaned = cleaned.split("-")[0].strip()
-    cleaned = cleaned.upper().replace("K", "000").replace("M", "000000")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return 0
 
 
 def _estimate_funding_amount(monthly_revenue: float) -> str:
