@@ -13,6 +13,7 @@ to keep the scoring criteria cheap on repeated calls.
 """
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -189,7 +190,14 @@ def score_conversation_urgency(messages: list[dict]) -> int:
     This is the fast/cheap fallback when you don't want to
     burn an API call on every conversation.
     """
-    text = " ".join(m.get("body", "") for m in messages).lower()
+    text = " ".join(m.get("body") or "" for m in messages).lower()
+    # Only the merchant's words signal intent — a rep saying "how fast"
+    # shouldn't raise the score. Fall back to everything if direction is unknown.
+    inbound = " ".join(
+        m.get("body") or "" for m in messages if m.get("direction") == "inbound"
+    ).lower()
+    if inbound:
+        text = inbound
 
     score = 3  # baseline
 
@@ -221,7 +229,10 @@ def score_conversation_urgency(messages: list[dict]) -> int:
         "wrong number", "remove me",
     ]
     for signal in negative:
-        if signal in text:
+        # Whole words, so "stop by" / "non-stop" don't kill a hot lead...
+        if re.search(r"\b" + re.escape(signal) + r"\b", text):
+            if signal == "stop" and not re.search(r"(^|[.!\s])stop[.!]?\s*$", text, re.M):
+                continue  # ...and bare STOP only counts as its own message/line
             score = 1
             break
 
@@ -233,7 +244,7 @@ def _format_conversation(messages: list[dict]) -> str:
     lines = []
     for msg in messages:
         direction = msg.get("direction", "unknown")
-        body = msg.get("body", "").strip()
+        body = (msg.get("body") or "").strip()
         msg_type = msg.get("type", "")
         timestamp = msg.get("dateAdded", "")
 

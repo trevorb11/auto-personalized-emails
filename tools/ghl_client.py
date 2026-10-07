@@ -22,7 +22,9 @@ from urllib.parse import urlencode
 import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import GHL_API_KEY, GHL_LOCATION_ID, GHL_BASE_URL, DRY_RUN
+import config
+from config import GHL_API_KEY, GHL_LOCATION_ID, GHL_BASE_URL
+from tools.parsing import normalize_business_name, normalize_domain
 
 logger = logging.getLogger(__name__)
 
@@ -164,24 +166,70 @@ async def get_contacts_by_tag(tag: str, limit: int = 100) -> list[dict]:
     return []
 
 
+async def find_duplicate_contact(phone: str = "", email: str = "") -> Optional[dict]:
+    """
+    Ask GHL for an existing contact with this exact phone or email, using
+    the location's own duplicate rules.
+    """
+    if not _check_api_key() or not (phone or email):
+        return None
+    params = {"locationId": GHL_LOCATION_ID}
+    if phone:
+        params["number"] = phone
+    if email:
+        params["email"] = email
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        try:
+            resp = await client.get(
+                f"{GHL_BASE_URL}/contacts/search/duplicate",
+                headers=_headers(),
+                params=params,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("contact") or None
+            logger.error(f"GHL duplicate check failed ({resp.status_code}): {resp.text[:200]}")
+        except httpx.HTTPError as e:
+            logger.error(f"GHL duplicate check failed: {e}")
+    return None
+
+
+def _same_business(lead: dict, contact: dict) -> bool:
+    """Exact (normalized) company-name or website match."""
+    lead_name = normalize_business_name(lead.get("business_name") or "")
+    contact_name = normalize_business_name(contact.get("companyName") or "")
+    if lead_name and lead_name == contact_name:
+        return True
+    lead_domain = normalize_domain(lead.get("website") or lead.get("domain") or "")
+    contact_domain = normalize_domain(contact.get("website") or "")
+    return bool(lead_domain and lead_domain == contact_domain)
+
+
 async def lookup_contact(
     phone: str = "",
     email: str = "",
     business_name: str = "",
+    website: str = "",
 ) -> Optional[dict]:
     """
-    Find an existing contact by phone, email, or business name.
-    Tries phone first (most unique), then email, then company name.
-    Returns the first match or None.
+    Find an existing contact for this lead.
+
+    Phone/email go through GHL's exact duplicate check. Business name uses
+    the fuzzy search endpoint, so results are only accepted when the
+    normalized company name or website actually matches — otherwise a
+    search for "Joe's Trucking" would flag every contact containing "Joe".
     """
     if not _check_api_key():
         return None
 
-    for query in [phone, email, business_name]:
-        if query:
-            results = await search_contacts(query, limit=5)
-            if results:
-                return results[0]
+    existing = await find_duplicate_contact(phone=phone, email=email)
+    if existing:
+        return existing
+
+    if business_name:
+        lead = {"business_name": business_name, "website": website}
+        for contact in await search_contacts(business_name, limit=10):
+            if _same_business(lead, contact):
+                return contact
     return None
 
 
@@ -193,42 +241,52 @@ async def create_contact(lead: dict) -> dict:
     """
     batch_date = lead.get("batch_date", datetime.now().strftime("%Y-%m-%d"))
 
+    # Business facts the reps want on the contact record
+    if not lead.get("ucc_filings") and lead.get("funder_display_name"):
+        funders = [lead["funder_display_name"]] + [
+            f.get("display_name") or f.get("funder", "")
+            for f in (lead.get("other_funders") or [])
+        ]
+        lead = {**lead, "ucc_filings": ", ".join(f for f in funders if f)}
+    if not lead.get("most_recent_filing_date") and lead.get("filing_date"):
+        lead = {**lead, "most_recent_filing_date": lead["filing_date"]}
+
     payload = {
         "locationId": GHL_LOCATION_ID,
-        "firstName": lead.get("first_name", ""),
-        "lastName": lead.get("last_name", ""),
-        "companyName": lead.get("business_name", ""),
-        "phone": lead.get("phone", ""),
-        "email": lead.get("email", ""),
-        "website": lead.get("website", ""),
-        "address1": lead.get("address", ""),
-        "city": lead.get("city", ""),
-        "state": lead.get("state", ""),
-        "source": lead.get("source", "AI Prospecting Agent"),
+        "firstName": (lead.get("first_name") or ""),
+        "lastName": (lead.get("last_name") or ""),
+        "companyName": (lead.get("business_name") or ""),
+        "phone": (lead.get("phone") or ""),
+        "email": (lead.get("email") or ""),
+        "website": (lead.get("website") or ""),
+        "address1": (lead.get("address") or ""),
+        "city": (lead.get("city") or ""),
+        "state": (lead.get("state") or ""),
+        "source": (lead.get("source") or "AI Prospecting Agent"),
         "tags": [
             f"tier-{lead.get('lead_tier', 'D')}",
             "agent-sourced",
             f"batch-{batch_date}",
         ],
         "customFields": [
-            {"key": "industry", "value": lead.get("industry", "")},
-            {"key": "monthly_revenue", "value": str(lead.get("monthly_revenue", ""))},
-            {"key": "years_in_business", "value": str(lead.get("years_in_business", ""))},
-            {"key": "qualified_amount", "value": lead.get("estimated_funding_amount", "TBD")},
-            {"key": "ucc_filings", "value": lead.get("ucc_filings", "")},
-            {"key": "most_recent_filing_date", "value": lead.get("most_recent_filing_date", "")},
+            {"key": "industry", "value": (lead.get("industry") or "")},
+            {"key": "monthly_revenue", "value": str(lead.get("monthly_revenue") or "")},
+            {"key": "years_in_business", "value": str(lead.get("years_in_business") or "")},
+            {"key": "qualified_amount", "value": (lead.get("estimated_funding_amount") or "TBD")},
+            {"key": "ucc_filings", "value": (lead.get("ucc_filings") or "")},
+            {"key": "most_recent_filing_date", "value": (lead.get("most_recent_filing_date") or "")},
             {
                 "key": "personalized_message__multi_line",
-                "value": lead.get("personalized_message", ""),
+                "value": (lead.get("personalized_message") or ""),
             },
-            {"key": "business_focus", "value": lead.get("business_focus", "New Funding")},
+            {"key": "business_focus", "value": (lead.get("business_focus") or "New Funding")},
             {"key": "lead_batch", "value": f"agent_{batch_date}"},
             {"key": "pipeline_selection", "value": "Main Pipeline"},
             {"key": "contact.source", "value": "AI Prospecting Agent"},
         ],
     }
 
-    if DRY_RUN:
+    if config.DRY_RUN:
         logger.info(f"DRY RUN: Would create GHL contact: {lead.get('business_name')}")
         return {
             "success": True,
@@ -245,9 +303,10 @@ async def create_contact(lead: dict) -> dict:
 
     # Deduplicate
     existing = await lookup_contact(
-        phone=lead.get("phone", ""),
-        email=lead.get("email", ""),
-        business_name=lead.get("business_name", ""),
+        phone=lead.get("phone") or "",
+        email=lead.get("email") or "",
+        business_name=lead.get("business_name") or "",
+        website=lead.get("website") or "",
     )
     if existing:
         logger.info(f"Duplicate in GHL: {existing.get('id')} ({lead.get('business_name')})")
@@ -284,7 +343,7 @@ async def create_contact(lead: dict) -> dict:
 
 async def update_contact(contact_id: str, fields: dict) -> dict:
     """Update specific fields on an existing GHL contact."""
-    if DRY_RUN:
+    if config.DRY_RUN:
         logger.info(f"DRY RUN: Would update GHL contact {contact_id}: {list(fields.keys())}")
         return {"success": True, "dry_run": True, "contact_id": contact_id}
 
@@ -314,7 +373,7 @@ async def add_contact_tags(contact_id: str, tags: list[str]) -> dict:
 
 async def add_contact_note(contact_id: str, body: str) -> dict:
     """Add a note to a contact."""
-    if DRY_RUN:
+    if config.DRY_RUN:
         logger.info(f"DRY RUN: Would add note to {contact_id}")
         return {"success": True, "dry_run": True}
 
@@ -326,7 +385,7 @@ async def add_contact_note(contact_id: str, body: str) -> dict:
             resp = await client.post(
                 f"{GHL_BASE_URL}/contacts/{contact_id}/notes",
                 headers=_headers(),
-                json={"body": body, "userId": GHL_LOCATION_ID},
+                json={"body": body},
             )
             if resp.status_code in (200, 201):
                 return {"success": True, "note_id": resp.json().get("note", {}).get("id")}
@@ -430,7 +489,7 @@ async def create_opportunity(
     source: str = "AI Prospecting Agent",
 ) -> dict:
     """Create an opportunity linked to a contact."""
-    if DRY_RUN:
+    if config.DRY_RUN:
         logger.info(f"DRY RUN: Would create opp '{name}' for contact {contact_id}")
         return {"success": True, "dry_run": True}
 

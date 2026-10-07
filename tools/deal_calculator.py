@@ -24,44 +24,73 @@ logger = logging.getLogger(__name__)
 BUSINESS_DAYS_PER_MONTH = 22
 
 
+def _periodic_rate(principal: float, payment: float, n_payments: int) -> float:
+    """
+    Solve principal = payment * (1 - (1+r)^-n) / r for r by bisection
+    (the rate that makes the payment stream worth the advance).
+    """
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        pv = payment * n_payments if mid == 0 else payment * (1 - (1 + mid) ** -n_payments) / mid
+        if pv > principal:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
 def factor_rate_to_apr(
     factor_rate: float,
     term_months: int,
     holdback_pct: float = 0.0,
+    payment_frequency: str = "daily",
 ) -> dict:
     """
     Convert an MCA factor rate to an estimated APR.
 
-    MCA factor rates aren't directly comparable to APR because
-    they don't account for principal declining over time. This
-    estimates the effective APR using the constant-payment method.
+    Because the merchant repays in fixed daily/weekly installments, the
+    average balance outstanding is roughly half the advance. Simply
+    annualizing the total cost (cost% × 12 / term) therefore understates
+    the APR by about half. This solves for the actual rate implied by the
+    payment stream (the same method used for state commercial-financing
+    APR disclosures), assuming fixed payments over the stated term.
 
     Args:
         factor_rate: e.g., 1.35 means pay back $1.35 for every $1 borrowed
         term_months: expected repayment term
-        holdback_pct: daily holdback percentage (if revenue-based), 0 for fixed
+        holdback_pct: unused; kept for backwards compatibility
+        payment_frequency: "daily" (business days) or "weekly"
 
     Returns:
-        dict with estimated_apr, total_cost_pct, and explanation.
+        dict with estimated_apr, simple_annualized_rate, total_cost_pct, and explanation.
     """
-    if factor_rate <= 1.0:
-        return {"estimated_apr": 0, "total_cost_pct": 0, "explanation": "Invalid factor rate"}
+    if factor_rate <= 1.0 or term_months <= 0:
+        return {"estimated_apr": 0, "total_cost_pct": 0, "explanation": "Invalid factor rate or term"}
 
     total_cost_pct = (factor_rate - 1.0) * 100
-    # Simple APR estimate: annualize the cost over the term
-    # This is a rough estimate — true APR requires amortization schedule
-    annual_factor = 12.0 / term_months
-    estimated_apr = total_cost_pct * annual_factor
+    simple_rate = total_cost_pct * 12.0 / term_months
+
+    if payment_frequency == "weekly":
+        periods_per_year = 52
+        n_payments = max(1, round(term_months * 52 / 12))
+    else:
+        periods_per_year = BUSINESS_DAYS_PER_MONTH * 12
+        n_payments = term_months * BUSINESS_DAYS_PER_MONTH
+
+    payment = factor_rate / n_payments  # per $1 advanced
+    estimated_apr = _periodic_rate(1.0, payment, n_payments) * periods_per_year * 100
 
     return {
         "factor_rate": factor_rate,
         "term_months": term_months,
         "total_cost_pct": round(total_cost_pct, 2),
         "estimated_apr": round(estimated_apr, 2),
+        "simple_annualized_rate": round(simple_rate, 2),
         "explanation": (
             f"Factor rate {factor_rate:.2f} over {term_months} months = "
             f"{total_cost_pct:.1f}% total cost. "
-            f"Estimated APR: {estimated_apr:.1f}%"
+            f"Estimated APR with {payment_frequency} payments: {estimated_apr:.1f}%"
         ),
     }
 
@@ -98,7 +127,7 @@ def analyze_offer(
         payments_per_month = 4
 
     monthly_obligation = payment_amount * payments_per_month
-    apr_info = factor_rate_to_apr(factor_rate, term_months)
+    apr_info = factor_rate_to_apr(factor_rate, term_months, payment_frequency=payment_frequency)
 
     return {
         "advance_amount": advance_amount,

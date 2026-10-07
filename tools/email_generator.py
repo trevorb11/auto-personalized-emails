@@ -14,39 +14,95 @@ Key differentiators vs. generic outreach:
 
 Tone: casual, direct, no corporate jargon.
 Never says "merchant cash advance" in first touch.
+
+Compliance:
+  - Every email ends with sender identity, postal address and an opt-out
+    line (CAN-SPAM); every SMS ends with STOP language (TCPA practice).
+  - Funder "positioning" lines are internal talking points with
+    comparative claims about named competitors. They go in the sales
+    notes for reps, never into merchant-facing copy.
+  - Savings figures are estimates, so they're phrased conditionally.
 """
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from tools.parsing import as_number, parse_money
+
+SMS_OPT_OUT = "Reply STOP to opt out."
 
 
-def generate_outreach_email(lead: dict) -> dict:
+def generate_outreach_email(lead: dict, use_llm: bool = False) -> dict:
     """
     Generate a personalized first-touch email for an MCA prospect.
 
     Args:
         lead: dict with business data, funder intelligence, payment
               estimates, urgency, and stacking info from the pipeline.
+        use_llm: if True (and EMAIL_LLM_PERSONALIZE / ANTHROPIC_API_KEY are
+              set), have Claude rewrite the template draft. Falls back to
+              the template on any failure.
 
     Returns:
-        dict with subject, body, sms_variant, and personalization_notes.
+        dict with subject, body, sms_variant, personalization_notes,
+        and generator ("template" or "claude").
     """
-    name = lead.get("business_name", "your business")
-    industry = lead.get("industry", "")
-    focus = lead.get("business_focus", "New Funding")
-    city = lead.get("city", "")
-    state = lead.get("state", "")
+    name = (lead.get("business_name") or "").strip() or "your business"
+    industry = lead.get("industry") or ""
+    focus = lead.get("business_focus") or "New Funding"
+    city = lead.get("city") or ""
+    state = lead.get("state") or ""
 
     location = f"{city}, {state}" if city and state else (city or state or "")
 
     if focus == "MCA Renewal":
-        return _renewal_email(lead, name, industry, location)
+        draft = _renewal_email(lead, name, industry, location)
     elif focus == "Consolidation":
-        return _consolidation_email(lead, name, industry, location)
+        draft = _consolidation_email(lead, name, industry, location)
     else:
-        return _new_funding_email(lead, name, industry, location)
+        draft = _new_funding_email(lead, name, industry, location)
+
+    draft["generator"] = "template"
+    if use_llm:
+        from tools.llm_personalizer import personalize_with_claude
+        rewritten = personalize_with_claude(lead, draft)
+        if rewritten:
+            draft.update(rewritten)
+            draft["generator"] = "claude"
+
+    draft["body"] = _with_greeting(lead, draft["body"]) + _email_footer()
+    draft["sms_variant"] = f"{draft['sms_variant'].rstrip()} {SMS_OPT_OUT}"
+    if not config.SENDER_ADDRESS:
+        draft["personalization_notes"].append(
+            "COMPLIANCE: SENDER_ADDRESS not set — add a postal address before sending"
+        )
+    return draft
+
+
+def _with_greeting(lead: dict, body: str) -> str:
+    """Replace the generic 'Hi,' with the contact's first name when we have it."""
+    first = (lead.get("first_name") or "").strip()
+    body = body.lstrip()
+    if body.startswith("Hi,"):
+        body = body[3:].lstrip("\n")
+    return f"Hi {first},\n\n{body}" if first else f"Hi,\n\n{body}"
+
+
+def _signature() -> str:
+    parts = [p for p in (config.SENDER_NAME, config.SENDER_COMPANY) if p]
+    if config.SENDER_PHONE:
+        parts.append(config.SENDER_PHONE)
+    return "— " + "\n".join(parts) if parts else ""
+
+
+def _email_footer() -> str:
+    lines = ["", "", _signature(), "", "---"]
+    if config.SENDER_ADDRESS:
+        lines.append(f"{config.SENDER_COMPANY} · {config.SENDER_ADDRESS}")
+    lines.append(config.OPT_OUT_TEXT)
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -58,26 +114,21 @@ def _renewal_email(lead: dict, name: str, industry: str, location: str) -> dict:
     Template for businesses in the MCA renewal window.
     Names the funder, shows estimated payments, and offers rate comparison.
     """
-    filing_age = lead.get("ucc_filing_age_months") or lead.get("filing_age_months") or 0
-    funder_name = lead.get("funder_display_name") or lead.get("secured_party", "")
-    funder_positioning = lead.get("funder_positioning", "")
-    funder_weakness = lead.get("funder_weakness", "")
-    urgency = lead.get("urgency", {})
+    filing_age = as_number(lead.get("ucc_filing_age_months") or lead.get("filing_age_months"))
+    funder_name = lead.get("funder_display_name") or lead.get("secured_party") or ""
+    urgency = lead.get("urgency") or {}
     urgency_level = urgency.get("level", "")
-    est_daily = lead.get("estimated_daily_payment", 0)
-    est_monthly = lead.get("estimated_monthly_obligation", 0)
-    est_remaining = lead.get("estimated_remaining_balance", 0)
-    est_months_left = lead.get("estimated_months_remaining", 0)
-    reviews = lead.get("google_review_count", 0)
-    funding_amount = lead.get("estimated_funding_amount", "")
+    est_daily = as_number(lead.get("estimated_daily_payment"))
+    est_monthly = as_number(lead.get("estimated_monthly_obligation"))
+    reviews = int(as_number(lead.get("google_review_count")))
 
     # ── Funder-specific opener ──────────────────────────────────
     if funder_name:
         opener = f"I noticed {name} has a funding position with {funder_name}"
-        if filing_age:
+        if filing_age >= 1:
             opener += f" from about {int(filing_age)} months ago"
         opener += "."
-    elif filing_age:
+    elif filing_age >= 1:
         opener = f"I noticed {name} took on some business funding about {int(filing_age)} months ago."
     else:
         opener = f"I came across {name} and wanted to reach out."
@@ -107,33 +158,25 @@ def _renewal_email(lead: dict, name: str, industry: str, location: str) -> dict:
         timing_hook = ""
 
     # ── Payment comparison (the real differentiator) ────────────
+    # Estimates come from typical terms for the funder, not the merchant's
+    # actual contract — so the numbers are framed as "if", not as fact.
     savings_line = ""
-    if est_daily and est_daily > 100:
-        # Estimate 20% savings (conservative)
+    if est_daily > 100:
         better_daily = est_daily * 0.80
         monthly_savings = (est_daily - better_daily) * 22
         savings_line = (
-            f"\n\nRight now you're probably paying somewhere around "
-            f"${est_daily:,.0f}/day. Based on what we're seeing for "
-            f"{'businesses in ' + location if location else 'similar businesses'}, "
-            f"we could likely get that closer to ${better_daily:,.0f}/day — "
-            f"that's roughly ${monthly_savings:,.0f}/mo back in your pocket."
+            f"\n\nDeals like that often run somewhere around "
+            f"${est_daily:,.0f}/day. If we can get a renewal closer to "
+            f"${better_daily:,.0f}/day, that's roughly ${monthly_savings:,.0f}/mo "
+            f"back in your pocket."
         )
-    elif est_monthly and est_monthly > 2000:
-        better_monthly = est_monthly * 0.80
-        monthly_savings = est_monthly - better_monthly
+    elif est_monthly > 2000:
+        monthly_savings = est_monthly * 0.20
         savings_line = (
-            f"\n\nWe've been saving businesses like yours around "
-            f"${monthly_savings:,.0f}/mo on their funding costs. "
-            f"Takes about 5 minutes to see if the numbers work for {name}."
+            f"\n\nEven a 20% better rate on a deal that size is around "
+            f"${monthly_savings:,.0f}/mo. Takes about 5 minutes to see if "
+            f"the numbers work for {name}."
         )
-
-    # ── Funder-specific competitive hook ────────────────────────
-    competitive_line = ""
-    if funder_positioning:
-        competitive_line = f"\n\n{funder_positioning}"
-    elif funder_weakness:
-        competitive_line = f"\n\nJust so you know — {funder_weakness.lower()}"
 
     # ── Industry hook ───────────────────────────────────────────
     industry_hook = _get_industry_hook(industry)
@@ -141,7 +184,7 @@ def _renewal_email(lead: dict, name: str, industry: str, location: str) -> dict:
     # ── Review credibility ──────────────────────────────────────
     review_note = ""
     if reviews >= 50:
-        review_note = f" Your {reviews} reviews tell me you're running a solid operation."
+        review_note = f"Your {reviews} reviews tell me you're running a solid operation."
 
     # ── Assemble ────────────────────────────────────────────────
     subject = f"Quick question about {name}"
@@ -150,25 +193,19 @@ def _renewal_email(lead: dict, name: str, industry: str, location: str) -> dict:
         f"Hi,\n\n"
         f"{opener}{timing_hook}\n\n"
         f"{industry_hook}{review_note}"
-        f"{savings_line}"
-        f"{competitive_line}\n\n"
+        f"{savings_line}\n\n"
         f"Would it make sense to do a quick comparison? No cost, no obligation — "
-        f"just want to see if we can do better than what's in place.\n\n"
-        f"— Today Capital Group"
+        f"just want to see if we can do better than what's in place."
     )
 
     # ── SMS variant ─────────────────────────────────────────────
-    sms_parts = [f"Hey, this is TCG."]
+    sms_parts = [f"Hey, this is {config.SENDER_COMPANY}."]
     if funder_name:
         sms_parts.append(f"I saw {name} has funding with {funder_name}.")
     else:
         sms_parts.append(f"I saw {name} might be coming up on a funding renewal.")
 
-    if est_daily and est_daily > 100:
-        better_daily = est_daily * 0.80
-        sms_parts.append(f"We're getting businesses like yours from ~${est_daily:,.0f}/day down to ~${better_daily:,.0f}/day.")
-    else:
-        sms_parts.append("We've been getting better terms for businesses like yours lately.")
+    sms_parts.append("We may be able to beat your renewal terms.")
 
     sms_parts.append("Worth a quick look?")
 
@@ -189,16 +226,16 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
     Template for stacked merchants. Shows combined obligation,
     names funders, and pitches single-payment consolidation.
     """
-    filing_age = lead.get("ucc_filing_age_months") or lead.get("filing_age_months") or 0
-    funder_name = lead.get("funder_display_name") or lead.get("secured_party", "")
-    position_count = lead.get("position_count", 1) or 1
-    other_funders = lead.get("other_funders", [])
-    est_daily = lead.get("estimated_daily_payment", 0)
-    est_monthly = lead.get("estimated_monthly_obligation", 0)
-    est_remaining = lead.get("estimated_remaining_balance", 0)
-    reviews = lead.get("google_review_count", 0)
-    urgency = lead.get("urgency", {})
-    monthly_revenue = lead.get("monthly_revenue", 0)
+    filing_age = as_number(lead.get("ucc_filing_age_months") or lead.get("filing_age_months"))
+    funder_name = lead.get("funder_display_name") or lead.get("secured_party") or ""
+    position_count = int(as_number(lead.get("position_count"), 1) or 1)
+    other_funders = lead.get("other_funders") or []
+    est_daily = as_number(lead.get("estimated_daily_payment"))
+    est_monthly = as_number(lead.get("estimated_monthly_obligation"))
+    # Review-count revenue guesses are too rough to quote back to a merchant
+    monthly_revenue = (
+        0 if lead.get("revenue_is_estimate") else parse_money(lead.get("monthly_revenue"))
+    )
 
     # ── Stacking-aware opener ───────────────────────────────────
     if position_count >= 3:
@@ -225,17 +262,19 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
             opener = (
                 f"I saw {name} has a couple of active funding positions."
             )
-    elif funder_name:
+    elif funder_name and filing_age >= 1:
         opener = (
             f"I noticed {name} has a position with {funder_name} "
             f"from about {int(filing_age)} months ago."
         )
+    elif funder_name:
+        opener = f"I noticed {name} has a funding position with {funder_name}."
     else:
-        opener = f"I work with businesses that have multiple funding positions."
+        opener = f"I came across {name} and wanted to reach out."
 
     # ── Payment strain (the money hook) ─────────────────────────
     strain_line = ""
-    if est_daily and est_daily > 100 and position_count >= 2:
+    if est_daily > 100 and position_count >= 2:
         # Estimate combined daily across positions
         combined_daily = est_daily * position_count * 0.85  # overlap discount
         consolidated_daily = combined_daily * 0.60  # consolidation typically saves 30-40%
@@ -243,19 +282,17 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
         monthly_savings = daily_savings * 22
 
         strain_line = (
-            f"\n\nWith {position_count} positions, you're probably looking at "
-            f"somewhere around ${combined_daily:,.0f}/day in combined debits. "
-            f"We can typically roll that into a single payment around "
-            f"${consolidated_daily:,.0f}/day — "
-            f"that's about ${monthly_savings:,.0f}/mo back in cash flow."
+            f"\n\nWith {position_count} positions, combined debits can easily "
+            f"run ${combined_daily:,.0f}/day or more. Rolling that into a single, "
+            f"longer-term payment around ${consolidated_daily:,.0f}/day would "
+            f"free up roughly ${monthly_savings:,.0f}/mo in cash flow."
         )
-    elif est_monthly and est_monthly > 3000:
-        consolidated_monthly = est_monthly * 0.65
-        monthly_savings = est_monthly - consolidated_monthly
+    elif est_monthly > 3000 and position_count >= 2:
+        monthly_savings = est_monthly * 0.35
         strain_line = (
-            f"\n\nConsolidating could save you roughly ${monthly_savings:,.0f}/mo "
-            f"and give you one predictable payment instead of "
-            f"{position_count} separate ones."
+            f"\n\nConsolidating could free up something like "
+            f"${monthly_savings:,.0f}/mo and give you one predictable payment "
+            f"instead of {position_count} separate ones."
         )
     elif position_count >= 2:
         strain_line = (
@@ -266,7 +303,7 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
 
     # ── Revenue strain callout ──────────────────────────────────
     revenue_line = ""
-    if monthly_revenue and est_monthly and monthly_revenue > 0:
+    if monthly_revenue > 0 and est_monthly > 0:
         strain_pct = (est_monthly / monthly_revenue) * 100
         if strain_pct > 30:
             revenue_line = (
@@ -278,8 +315,12 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
     industry_hook = _get_industry_hook(industry)
 
     # ── Assemble ────────────────────────────────────────────────
-    first_word = name.split()[0] if name else ""
-    subject = f"Simplify your payments, {first_word}?" if first_word else "Simplify your funding payments?"
+    first_name = (lead.get("first_name") or "").strip()
+    subject = (
+        f"Simplify your payments, {first_name}?" if first_name
+        else f"One payment instead of {position_count} for {name}?" if position_count >= 2
+        else f"Quick question about {name}"
+    )
 
     body = (
         f"Hi,\n\n"
@@ -288,12 +329,11 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
         f"{revenue_line}\n\n"
         f"{industry_hook}"
         f"It takes about 5 minutes to see if the numbers work. "
-        f"Want me to run a quick comparison?\n\n"
-        f"— Today Capital Group"
+        f"Want me to run a quick comparison?"
     )
 
     # ── SMS ─────────────────────────────────────────────────────
-    sms_parts = [f"Hey, TCG here."]
+    sms_parts = [f"Hey, {config.SENDER_COMPANY} here."]
     if position_count >= 2:
         sms_parts.append(
             f"I saw {name} has {position_count} funding positions."
@@ -320,12 +360,12 @@ def _consolidation_email(lead: dict, name: str, industry: str, location: str) ->
 
 def _new_funding_email(lead: dict, name: str, industry: str, location: str) -> dict:
     """Template for new funding prospects with intent signals."""
-    reviews = lead.get("google_review_count", 0)
-    employees = lead.get("employee_count", 0)
-    rating = lead.get("google_rating", 0)
-    snippet = lead.get("snippet", "")
-    source = lead.get("source", "")
-    funding_amount = lead.get("estimated_funding_amount", "")
+    reviews = int(as_number(lead.get("google_review_count")))
+    employees = int(as_number(lead.get("employee_count")))
+    rating = as_number(lead.get("google_rating"))
+    snippet = lead.get("snippet") or ""
+    source = lead.get("source") or ""
+    funding_amount = lead.get("estimated_funding_amount") or ""
 
     # ── Intent-signal opener ────────────────────────────────────
     # If we found them through search, reference what we saw
@@ -371,13 +411,12 @@ def _new_funding_email(lead: dict, name: str, industry: str, location: str) -> d
     amount_mention = ""
     if funding_amount and funding_amount != "TBD":
         amount_mention = (
-            f"Based on what I can see, you'd likely qualify for "
-            f"somewhere in the {funding_amount} range with approval "
-            f"in 24-48 hours.\n\n"
+            f"businesses your size typically see options in the "
+            f"{funding_amount} range, often with a decision in 24-48 hours.\n\n"
         )
     else:
         amount_mention = (
-            "We do $15K to $500K with approvals in 24-48 hours.\n\n"
+            "we work with options from $15K to $500K, often with a decision in 24-48 hours.\n\n"
         )
 
     # ── Assemble ────────────────────────────────────────────────
@@ -390,18 +429,17 @@ def _new_funding_email(lead: dict, name: str, industry: str, location: str) -> d
         f"If {name} ever needs working capital — equipment, payroll, "
         f"inventory, expansion — {amount_mention}"
         f"No obligation to see what you qualify for. "
-        f"Want me to send over some numbers?\n\n"
-        f"— Today Capital Group"
+        f"Want me to send over some numbers?"
     )
 
     # ── SMS ─────────────────────────────────────────────────────
-    sms_parts = [f"Hi, TCG here."]
+    sms_parts = [f"Hi, {config.SENDER_COMPANY} here."]
     sms_parts.append(
         f"We help businesses"
         f"{' in ' + location if location else ''} "
         f"get fast working capital"
         f"{f' ({funding_amount})' if funding_amount and funding_amount != 'TBD' else ' ($15K-$500K)'},"
-        f" 24hr approval."
+        f" with quick decisions."
     )
     sms_parts.append(f"Would {name} ever need something like that?")
 
@@ -484,25 +522,33 @@ def _build_notes(lead: dict) -> list[str]:
     if funder:
         notes.append(f"Current funder: {funder}")
 
-    funder_weakness = lead.get("funder_weakness", "")
+    funder_weakness = lead.get("funder_weakness") or ""
     if funder_weakness:
         notes.append(f"Funder weakness: {funder_weakness}")
 
-    position_count = lead.get("position_count", 1) or 1
+    funder_positioning = lead.get("funder_positioning") or ""
+    if funder_positioning:
+        notes.append(f"Talking point (verbal only): {funder_positioning}")
+
+    position_count = int(as_number(lead.get("position_count"), 1) or 1)
     if position_count > 1:
         notes.append(f"Stacked: {position_count} positions")
 
-    urgency = lead.get("urgency", {})
+    urgency = lead.get("urgency") or {}
     if urgency.get("message"):
         notes.append(f"Timing: {urgency['message']}")
 
-    est_daily = lead.get("estimated_daily_payment", 0)
+    est_daily = as_number(lead.get("estimated_daily_payment"))
     if est_daily:
-        notes.append(f"Est. daily payment: ${est_daily:,.0f}")
+        notes.append(f"Est. daily payment (from typical terms): ${est_daily:,.0f}")
 
-    est_remaining = lead.get("estimated_remaining_balance", 0)
+    est_remaining = as_number(lead.get("estimated_remaining_balance"))
     if est_remaining:
         notes.append(f"Est. remaining balance: ${est_remaining:,.0f}")
+
+    best_match = lead.get("best_funder_match")
+    if best_match:
+        notes.append(f"Best-fit funder: {best_match}")
 
     funder_tier = lead.get("funder_tier")
     if funder_tier and funder_tier >= 2:

@@ -17,17 +17,35 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DB_PATH, MCA_LENDERS, MCA_LENDER_PROFILES
-from data.database import get_connection, get_unprocessed_filings
+from config import (
+    MCA_LENDERS, MCA_LENDER_PROFILES,
+    UCC_MIN_AGE_MONTHS, UCC_MAX_AGE_MONTHS,
+)
+from data.database import (
+    get_connection, get_unprocessed_filings, get_debtor_filing_history,
+)
+from tools.parsing import match_lender, normalize_business_name
 
 
 def _get_funder_profile(secured_party: str) -> dict:
     """Look up competitive intelligence for a funder from the secured party name."""
-    secured_lower = secured_party.lower()
-    for lender_key, profile in MCA_LENDER_PROFILES.items():
-        if lender_key in secured_lower:
-            return profile
-    return {}
+    lender_key = match_lender(secured_party or "", MCA_LENDER_PROFILES.keys())
+    return MCA_LENDER_PROFILES.get(lender_key, {}) if lender_key else {}
+
+
+def is_mca_lender(secured_party: str) -> bool:
+    """Whole-word match against the known MCA lender list."""
+    return match_lender(secured_party or "", MCA_LENDERS) is not None
+
+
+def _filing_age_months(filing_date: str):
+    if not filing_date:
+        return None
+    try:
+        dt = datetime.fromisoformat(filing_date)
+    except (ValueError, TypeError):
+        return None
+    return round((datetime.now() - dt).days / 30, 1)
 
 
 def _estimate_advance_and_payments(
@@ -135,65 +153,78 @@ def _get_urgency_level(filing_age_months: float) -> dict:
 
 def process_ucc_filings(
     state: str,
-    days_back: int = 7,
-    min_filing_age_months: float = 6,
+    min_age_months: float = UCC_MIN_AGE_MONTHS,
+    max_age_months: float = UCC_MAX_AGE_MONTHS,
     limit: int = 100,
+    renewal_window: tuple[float, float] = (6, 12),
 ) -> dict:
     """
     Process UCC filing data to identify MCA renewal and consolidation
     opportunities. Enriches each filing with funder intelligence,
     estimated payments, and urgency scoring.
+
+    Pulls filings whose *age* is within [min_age_months, max_age_months]
+    and that haven't become leads yet. Stacking is detected against the
+    debtor's full filing history in the DB, not just this batch.
     """
     conn = get_connection()
 
     try:
         filings = get_unprocessed_filings(
-            conn, state=state, days_back=days_back, limit=limit
+            conn, state=state,
+            min_age_months=min_age_months, max_age_months=max_age_months,
+            limit=limit,
         )
 
-        # Group filings by debtor name to detect stacking
-        debtor_filings = {}
-        for filing in filings:
-            name = (filing.get("debtor_name") or "").strip().lower()
-            if name:
-                debtor_filings.setdefault(name, []).append(filing)
-
         results = []
+        seen_debtors = set()
         for filing in filings:
-            secured = (filing.get("secured_party") or "").lower()
-            is_mca = any(lender in secured for lender in MCA_LENDERS)
+            # One lead per debtor per run: the newest qualifying filing
+            # represents the merchant; the rest become stacking context.
+            debtor_norm = (
+                filing.get("debtor_name_normalized")
+                or normalize_business_name(filing.get("debtor_name") or "")
+            )
+            if debtor_norm and debtor_norm in seen_debtors:
+                continue
+            if debtor_norm:
+                seen_debtors.add(debtor_norm)
+
+            secured = filing.get("secured_party") or ""
+            is_mca = (
+                filing.get("secured_party_type") == "MCA_LENDER"
+                or is_mca_lender(secured)
+            )
 
             filing_date = filing.get("filing_date")
-            age_months = None
-            if filing_date:
-                try:
-                    dt = datetime.fromisoformat(filing_date)
-                    age_months = round((datetime.now() - dt).days / 30, 1)
-                except (ValueError, TypeError):
-                    pass
+            age_months = _filing_age_months(filing_date)
 
             in_renewal_window = (
                 age_months is not None
-                and min_filing_age_months <= age_months <= 12
+                and renewal_window[0] <= age_months <= renewal_window[1]
             )
 
             # ── Funder competitive intelligence ──────────────────
-            funder_profile = _get_funder_profile(filing.get("secured_party", ""))
+            funder_profile = _get_funder_profile(secured)
             payment_estimates = _estimate_advance_and_payments(funder_profile, age_months)
             urgency = _get_urgency_level(age_months)
 
-            # ── Multi-filing / stacking detection ────────────────
-            debtor_name = (filing.get("debtor_name") or "").strip().lower()
-            all_filings_for_debtor = debtor_filings.get(debtor_name, [])
-            other_filings = [
-                f for f in all_filings_for_debtor
-                if f.get("id") != filing.get("id")
+            # ── Multi-filing / stacking detection (full history) ─
+            history = get_debtor_filing_history(
+                conn, debtor_norm, filing.get("debtor_state") or state,
+            )
+            other_filings = [f for f in history if f.get("id") != filing.get("id")]
+            # Only other MCA positions count toward stacking — a bank or
+            # equipment UCC is not a daily debit.
+            other_mca = [
+                f for f in other_filings
+                if f.get("secured_party_type") == "MCA_LENDER"
+                or is_mca_lender(f.get("secured_party") or "")
             ]
-            position_count = 1 + len(other_filings)
+            position_count = (1 if is_mca else 0) + len(other_mca)
 
-            # Build history of other funders
             other_funders = []
-            for other in other_filings:
+            for other in other_mca:
                 other_secured = other.get("secured_party", "")
                 other_profile = _get_funder_profile(other_secured)
                 other_funders.append({
@@ -205,7 +236,7 @@ def process_ucc_filings(
             result = {
                 "filing_id": filing.get("id"),
                 "business_name": filing.get("debtor_name"),
-                "secured_party": filing.get("secured_party"),
+                "secured_party": secured,
                 "filing_date": filing_date,
                 "filing_number": filing.get("filing_number"),
                 "address": filing.get("debtor_address"),
@@ -216,7 +247,7 @@ def process_ucc_filings(
                 "filing_age_months": age_months,
                 "in_renewal_window": in_renewal_window,
                 "secured_party_type": filing.get("secured_party_type"),
-                # ── New competitive intelligence fields ──────────
+                # ── Competitive intelligence ─────────────────────
                 "funder_display_name": funder_profile.get("display_name", ""),
                 "funder_tier": funder_profile.get("tier"),
                 "funder_weakness": funder_profile.get("weakness", ""),
@@ -249,7 +280,8 @@ def process_ucc_filings(
 
         return {
             "state": state,
-            "days_back": days_back,
+            "min_age_months": min_age_months,
+            "max_age_months": max_age_months,
             "total_filings": len(results),
             "mca_filings": mca_count,
             "in_renewal_window": renewal_count,
@@ -261,7 +293,7 @@ def process_ucc_filings(
         conn.close()
 
 
-def get_filing_summary(states: list[str], days_back: int = 7) -> dict:
+def get_filing_summary(states: list[str]) -> dict:
     """Get a summary across multiple states."""
     summary = {
         "states": {},
@@ -271,7 +303,7 @@ def get_filing_summary(states: list[str], days_back: int = 7) -> dict:
     }
 
     for state in states:
-        result = process_ucc_filings(state, days_back=days_back)
+        result = process_ucc_filings(state)
         summary["states"][state] = {
             "total": result["total_filings"],
             "mca": result["mca_filings"],
@@ -288,5 +320,5 @@ def get_filing_summary(states: list[str], days_back: int = 7) -> dict:
 if __name__ == "__main__":
     from data.database import init_db
     init_db()
-    result = process_ucc_filings("FL", days_back=30)
+    result = process_ucc_filings("FL")
     print(json.dumps(result, indent=2))
